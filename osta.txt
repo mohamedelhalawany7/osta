@@ -460,6 +460,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Workshop Kiosk AI", lifespan=lifespan)
 
+# --- إضافة دعم CORS ليعمل التطبيق بسلاسة مع أي واجهة خارجية مثل Streamlit ---
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
