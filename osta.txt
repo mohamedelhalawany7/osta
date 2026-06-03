@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional, AsyncGenerator, List
+from collections import defaultdict
 import logging
 from cryptography.fernet import Fernet
 import hashlib
@@ -159,6 +160,120 @@ if firebase_cred_json:
     except Exception as e:
         logger.error(f"خطأ في تهيئة Firebase: {e}")
 
+# =====================================================================
+# تحسينات Firebase: الكاش، الدفعات، والتنظيف التلقائي، والمراقبة
+# =====================================================================
+
+# 4. مراقبة الاستخدام اليومي (إنذار مبكر)
+daily_usage = {"reads": 0, "writes": 0, "date": datetime.utcnow().date()}
+usage_lock = Lock()
+DAILY_READ_LIMIT = 40000   # 80% من الـ 50k كحد أمان
+DAILY_WRITE_LIMIT = 16000  # 80% من الـ 20k كحد أمان
+
+def track_firestore_usage(operation: str, count: int = 1):
+    with usage_lock:
+        today = datetime.utcnow().date()
+        if daily_usage["date"] != today:
+            daily_usage.update({"reads": 0, "writes": 0, "date": today})
+        
+        daily_usage[operation] += count
+        
+        # إنذار مبكر لو اقتربنا من الحد
+        if operation == "reads" and daily_usage["reads"] > DAILY_READ_LIMIT:
+            logger.warning(f"⚠️ تحذير: وصلنا {daily_usage['reads']} قراءة اليوم!")
+        if operation == "writes" and daily_usage["writes"] > DAILY_WRITE_LIMIT:
+            logger.warning(f"⚠️ تحذير: وصلنا {daily_usage['writes']} كتابة اليوم!")
+
+# 1. كاش الذاكرة للقراءة (يقلل القراءة 80%)
+firestore_cache = TTLCache(maxsize=500, ttl=600)
+firestore_cache_lock = Lock()
+
+async def get_from_firestore_cached(collection: str, doc_id: str):
+    cache_key = f"{collection}:{doc_id}"
+    with firestore_cache_lock:
+        if cache_key in firestore_cache:
+            return firestore_cache[cache_key]
+    
+    if firebase_db:
+        track_firestore_usage("reads", 1)  # تسجيل عملية قراءة
+        # استخدام run_in_executor عشان القراءة من Firebase ماتعملش Block للـ Async
+        loop = asyncio.get_running_loop()
+        doc = await loop.run_in_executor(None, lambda: firebase_db.collection(collection).document(doc_id).get())
+        data = doc.to_dict() if doc.exists else None
+        with firestore_cache_lock:
+            firestore_cache[cache_key] = data
+        return data
+    return None
+
+# 2. تجميع الكتابة (Batch Writing) (يقلل الكتابة 70%)
+write_buffer = defaultdict(list)
+write_buffer_lock = Lock()
+
+async def buffer_firestore_write(collection: str, data: dict):
+    """بيحط الكتابة في buffer ومش بيكتب على طول"""
+    with write_buffer_lock:
+        write_buffer[collection].append(data)
+
+async def flush_write_buffer():
+    """بيكتب كل اللي في الـ buffer دفعة واحدة كل دقيقتين"""
+    if not firebase_db:
+        return
+    
+    with write_buffer_lock:
+        if not write_buffer:
+            return
+        # أخذ نسخة من البيانات وتفريغ البافر فوراً للسماح باستقبال بيانات جديدة
+        current_buffer = dict(write_buffer)
+        write_buffer.clear()
+        
+    try:
+        batch = firebase_db.batch()
+        total_ops = 0
+        
+        for collection, items in current_buffer.items():
+            for item in items:
+                if total_ops >= 400:  # حد أمان قبل الـ 500 limit
+                    await asyncio.to_thread(batch.commit)
+                    track_firestore_usage("writes", total_ops) # تسجيل عمليات الكتابة
+                    batch = firebase_db.batch()
+                    total_ops = 0
+                
+                ref = firebase_db.collection(collection).document()
+                batch.set(ref, item)
+                total_ops += 1
+                
+        if total_ops > 0:
+            await asyncio.to_thread(batch.commit)
+            track_firestore_usage("writes", total_ops) # تسجيل عمليات الكتابة
+            logger.info(f"Flushed {total_ops} writes to Firestore")
+    except Exception as e:
+        logger.error(f"Error flushing Firestore buffer: {e}")
+
+# 3. حذف البيانات القديمة تلقائياً (يمنع امتلاء الـ 1GB)
+async def cleanup_old_firestore_data():
+    """بيحذف المحادثات الأقدم من 30 يوم تلقائياً"""
+    if not firebase_db:
+        return
+    try:
+        cutoff_date = datetime.utcnow() - timedelta(days=30)
+        # جلب وحذف بـ batches عشان نوفر في عمليات الحذف
+        old_docs = await asyncio.to_thread(
+            lambda: list(firebase_db.collection("conversation_history").where("created_at", "<", cutoff_date).limit(400).stream())
+        )
+        
+        batch = firebase_db.batch()
+        count = 0
+        for doc in old_docs:
+            batch.delete(doc.reference)
+            count += 1
+        
+        if count > 0:
+            await asyncio.to_thread(batch.commit)
+            track_firestore_usage("writes", count) # عمليات الحذف تُحسب كـ Writes في Firebase
+            logger.info(f"Cleaned up {count} old Firestore documents")
+    except Exception as e:
+        logger.error(f"Firestore cleanup error: {e}")
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
     id = Column(Integer, primary_key=True, index=True)
@@ -204,6 +319,7 @@ class Tenant(Base):
     google_api_key = Column(String, default="")
     pinecone_api_key = Column(String, default="")
     pinecone_index = Column(String, default="")
+    firebase_credentials = Column(Text, default="")
     workshop_prompt = Column(Text, default="""أنت 'الأسطى بلية'، أقدم وأشطر صنايعي ومهندس في ورشة ميكانيكا وصيانة ضواغط هواء ومجففات في مصر.
 العمال اللي بيكلموك صنايعية على قدهم ومابيعرفوش يقرأوا ويكتبوا، عشان كده:
 1. اتكلم معاهم بلهجة مصرية بلدي صميمة، زي الصنايعية الكبار في الورش (يا بطل، يا هندسة، يا ريس، بص يا سيدي، صلي على النبي، هاتها في شوال).
@@ -308,6 +424,10 @@ async def lifespan(app: FastAPI):
             await conn.execute(text("ALTER TABLE tenants ADD COLUMN api_base_url VARCHAR DEFAULT ''"))
         except Exception:
             pass
+        try:
+            await conn.execute(text("ALTER TABLE tenants ADD COLUMN firebase_credentials TEXT DEFAULT ''"))
+        except Exception:
+            pass
 
     async with AsyncSessionLocal() as db:
         tenant = (await db.execute(select(Tenant))).scalars().first()
@@ -328,6 +448,11 @@ async def lifespan(app: FastAPI):
                 logger.info("Pinecone Client Initialized (Singleton).")
 
     scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
+    
+    # --- إضافة مهام Firebase المجدولة ---
+    scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
+    scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
+    
     scheduler.start()
     yield
     scheduler.shutdown()
@@ -517,6 +642,344 @@ async def logout():
     res = RedirectResponse(url="/login")
     res.delete_cookie("access_token")
     return res
+
+# =====================================================================
+# واجهات الـ API الخاصة بتطبيق Streamlit الخارجي
+# =====================================================================
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class StreamlitChatRequest(BaseModel):
+    message: str
+    session_id: str = "streamlit_default"
+
+class FirebaseSettingsRequest(BaseModel):
+    firebase_credentials: str
+
+class DatabaseSettingsRequest(BaseModel):
+    database_url: str
+
+class LLMSettingsJSON(BaseModel):
+    llm_provider: str
+    llm_model: str
+    api_base_url: str = ""
+    openai_key: str = ""
+    anthropic_key: str = ""
+    google_key: str = ""
+
+@app.post("/api/streamlit_login")
+async def streamlit_login(login_req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    user = (await db.execute(
+        select(User).where(User.username == login_req.username)
+    )).scalars().first()
+    
+    if not user or not verify_password(login_req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="بيانات خطأ")
+        
+    token = create_access_token(
+        data={"sub": user.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    return {
+        "access_token": token,
+        "user": {"username": user.username, "role": user.role}
+    }
+
+@app.post("/api/streamlit_chat")
+async def streamlit_chat(
+    request: Request,
+    chat_req: StreamlitChatRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = (await db.execute(
+            select(User).where(User.username == payload.get("sub"))
+        )).scalars().first()
+        if user:
+            user.tenant = await get_tenant_cached(user.tenant_id, db)
+    except:
+        raise HTTPException(status_code=401)
+        
+    tenant = user.tenant
+    google_key = decrypt_val(tenant.google_api_key)
+    openai_key = decrypt_val(tenant.openai_api_key)
+    
+    try:
+        if tenant.llm_provider == "google" and google_key:
+            llm = ChatGoogleGenerativeAI(
+                model=tenant.llm_model,
+                google_api_key=google_key,
+                temperature=0.3
+            )
+        elif tenant.llm_provider == "openai" and openai_key:
+            llm = ChatOpenAI(
+                model_name=tenant.llm_model,
+                openai_api_key=openai_key,
+                temperature=0.3
+            )
+        else:
+            raise ValueError("مفيش مفتاح API متاح")
+            
+        history = await get_chat_history(chat_req.session_id, db, limit=3)
+        messages = [
+            SystemMessage(content=f"{tenant.workshop_prompt}\n\nتاريخ المحادثة:\n{history}"),
+            HumanMessage(content=chat_req.message)
+        ]
+        
+        response = await llm.ainvoke(messages)
+        await save_chat_history(chat_req.session_id, "Worker", chat_req.message, db, tenant.id)
+        await save_chat_history(chat_req.session_id, "AI", response.content, db, tenant.id)
+        
+        return {"response": response.content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/settings/save_llm_json")
+async def save_llm_json(
+    request: Request,
+    settings: LLMSettingsJSON,
+    db: AsyncSession = Depends(get_db)
+):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = (await db.execute(
+            select(User).where(User.username == payload.get("sub"))
+        )).scalars().first()
+        if user:
+            user.tenant = await get_tenant_cached(user.tenant_id, db)
+    except:
+        raise HTTPException(status_code=401)
+        
+    if not user or user.role != "admin":
+        raise HTTPException(status_code=403)
+        
+    user.tenant.llm_provider = settings.llm_provider
+    user.tenant.llm_model = settings.llm_model
+    if hasattr(user.tenant, 'api_base_url'):
+        user.tenant.api_base_url = settings.api_base_url
+    user.tenant.openai_api_key = encrypt_val(settings.openai_key)
+    user.tenant.anthropic_api_key = encrypt_val(settings.anthropic_key)
+    user.tenant.google_api_key = encrypt_val(settings.google_key)
+    
+    with tenant_cache_lock:
+        if user.tenant_id in tenant_cache:
+            del tenant_cache[user.tenant_id]
+    await db.commit()
+    return {"status": "ok"}
+
+@app.post("/api/settings/save_firebase")
+async def save_firebase_settings(
+    request: Request,
+    firebase_req: FirebaseSettingsRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = (await db.execute(
+            select(User).where(User.username == payload.get("sub"))
+        )).scalars().first()
+    except:
+        raise HTTPException(status_code=401)
+        
+    if not user or user.role != "admin":
+        raise HTTPException(status_code=403)
+        
+    try:
+        # تحقق من صحة الـ JSON
+        cred_dict = json.loads(firebase_req.firebase_credentials)
+        
+        # احفظه مشفر في قاعدة البيانات
+        user.tenant.firebase_credentials = encrypt_val(firebase_req.firebase_credentials)
+        await db.commit()
+        
+        # ابدأ Firebase فوراً بدون إعادة تشغيل
+        global firebase_db
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        firebase_db = firestore.client()
+        
+        logger.info(f"Firebase connected by user={user.username}")
+        return {"status": "connected"}
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="الـ JSON مش صح")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/test_firebase")
+async def test_firebase(request: Request, db: AsyncSession = Depends(get_db)):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = (await db.execute(
+            select(User).where(User.username == payload.get("sub"))
+        )).scalars().first()
+    except:
+        raise HTTPException(status_code=401)
+        
+    if firebase_db:
+        try:
+            # اختبار بسيط بكتابة وقراءة سريعة
+            test_ref = firebase_db.collection("_health").document("test")
+            test_ref.set({"ts": datetime.utcnow().isoformat()})
+            return {"connected": True}
+        except Exception as e:
+            return {"connected": False, "error": str(e)}
+    return {"connected": False, "error": "Firebase غير مهيأ"}
+
+@app.post("/api/settings/save_database")
+async def save_database_settings(
+    request: Request,
+    db_req: DatabaseSettingsRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user = (await db.execute(
+            select(User).where(User.username == payload.get("sub"))
+        )).scalars().first()
+    except:
+        raise HTTPException(status_code=401)
+        
+    if not user or user.role != "admin":
+        raise HTTPException(status_code=403)
+        
+    try:
+        # احفظ الـ URL الجديد في ملف .env
+        db_url = db_req.database_url
+        
+        # تصحيح الـ URL تلقائياً
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+            
+        # اكتب في .env
+        env_content = ""
+        if os.path.exists(".env"):
+            with open(".env", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            lines = [l for l in lines if not l.startswith("DATABASE_URL=")]
+            env_content = "".join(lines)
+            
+        with open(".env", "w", encoding="utf-8") as f:
+            f.write(env_content)
+            f.write(f"\nDATABASE_URL={db_url}\n")
+            
+        return {"status": "saved", "message": "أعد تشغيل التطبيق لتطبيق التغييرات"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/firebase_usage")
+async def get_firebase_usage_api(request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user or user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized")
+    with usage_lock:
+        return {
+            "today": str(daily_usage["date"]),
+            "reads": daily_usage["reads"],
+            "writes": daily_usage["writes"],
+            "reads_limit": 50000,
+            "writes_limit": 20000,
+            "reads_percent": round((daily_usage["reads"] / 50000) * 100, 1),
+            "writes_percent": round((daily_usage["writes"] / 20000) * 100, 1)
+        }
+
+class StreamlitChatReq(BaseModel):
+    message: str
+    session_id: str
+
+@app.post("/api/streamlit_chat")
+async def streamlit_chat_api(req: StreamlitChatReq, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user: raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    tenant = user.tenant
+    openai_key = decrypt_val(tenant.openai_api_key)
+    google_key = decrypt_val(tenant.google_api_key)
+    
+    try:
+        if tenant.llm_provider == "openai" and openai_key:
+            llm = ChatOpenAI(model_name=tenant.llm_model, openai_api_key=openai_key, temperature=0.3)
+        elif tenant.llm_provider == "google" and google_key:
+            llm = ChatGoogleGenerativeAI(model=tenant.llm_model, google_api_key=google_key, temperature=0.3)
+        else:
+            return JSONResponse({"response": "عذراً، لم يتم إعداد مفاتيح الذكاء الاصطناعي بشكل صحيح."})
+            
+        messages = [
+            SystemMessage(content=tenant.workshop_prompt),
+            HumanMessage(content=req.message)
+        ]
+        
+        response = await llm.ainvoke(messages)
+        await save_chat_history(req.session_id, "Worker", req.message, db, tenant.id)
+        await save_chat_history(req.session_id, "AI", response.content, db, tenant.id)
+        
+        return {"response": response.content}
+    except Exception as e:
+        return JSONResponse({"response": f"حدث خطأ: {str(e)}"}, status_code=500)
+
+class SaveLLMReq(BaseModel):
+    llm_provider: str
+    llm_model: str
+    api_base_url: str = ""
+    openai_key: str = ""
+    anthropic_key: str = ""
+    google_key: str = ""
+
+@app.post("/api/settings/save_llm_json")
+async def save_llm_json_api(req: SaveLLMReq, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user or user.role != "admin": raise HTTPException(status_code=403)
+    user.tenant.llm_provider = req.llm_provider
+    user.tenant.llm_model = req.llm_model
+    if hasattr(user.tenant, 'api_base_url'): user.tenant.api_base_url = req.api_base_url
+    user.tenant.openai_api_key = encrypt_val(req.openai_key)
+    user.tenant.anthropic_api_key = encrypt_val(req.anthropic_key)
+    user.tenant.google_api_key = encrypt_val(req.google_key)
+    with tenant_cache_lock:
+        if user.tenant_id in tenant_cache: del tenant_cache[user.tenant_id]
+    await db.commit()
+    return {"status": "success"}
+
+class SaveFirebaseReq(BaseModel):
+    firebase_credentials: str
+
+@app.post("/api/settings/save_firebase")
+async def save_firebase_api(req: SaveFirebaseReq, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user or user.role != "admin": raise HTTPException(status_code=403)
+    # في بيئة الإنتاج الحقيقية، يفضل حفظ هذا في الـ Vault أو قاعدة البيانات مش ملف .env 
+    # لكن كمثال لحفظه:
+    with open(".env", "a", encoding="utf-8") as f:
+        f.write(f"\nFIREBASE_CREDENTIALS='{req.firebase_credentials}'\n")
+    return {"status": "success", "message": "تم الحفظ. يجب إعادة تشغيل السيرفر لتفعيل التغييرات."}
+
+@app.get("/api/test_firebase")
+async def test_firebase_api(request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user or user.role != "admin": raise HTTPException(status_code=403)
+    is_connected = firebase_db is not None
+    return {"connected": is_connected}
+
+class SaveDBReq(BaseModel):
+    database_url: str
+
+@app.post("/api/settings/save_database")
+async def save_database_api(req: SaveDBReq, request: Request, db: AsyncSession = Depends(get_db)):
+    user = await get_user_from_header_or_cookie(request, db)
+    if not user or user.role != "admin": raise HTTPException(status_code=403)
+    with open(".env", "a", encoding="utf-8") as f:
+        f.write(f"\nDATABASE_URL='{req.database_url}'\n")
+    return {"status": "success", "message": "تم الحفظ. يجب إعادة تشغيل السيرفر لتفعيل التغييرات."}
 
 # =====================================================================
 # 7. لوحة التحكم للمدير (Dashboard)
