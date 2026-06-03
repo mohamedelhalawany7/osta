@@ -1,5 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn
 python-dotenv
 python-multipart
 sqlalchemy
@@ -7,7 +7,7 @@ aiosqlite
 asyncpg
 aiomysql
 bcrypt
-python-jose[cryptography]
+python-jose
 cryptography
 pydantic
 passlib
