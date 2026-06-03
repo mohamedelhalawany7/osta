@@ -2189,11 +2189,14 @@ if __name__ == "__main__":
 
     if "server_started" not in st.session_state:
         if not is_server_running():
-            with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية... برجاء الانتظار ثواني."):
-                # تشغيل السيرفر تلقائياً في الخلفية باستخدام نفس اسم الملف الحالي (osta)
+            with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
                 module_name = os.path.splitext(os.path.basename(__file__))[0]
                 subprocess.Popen([sys.executable, "-m", "uvicorn", f"{module_name}:app", "--host", "0.0.0.0", "--port", "8000"])
-                time.sleep(4)
+                # الانتظار الذكي: نفحص كل نصف ثانية (بحد أقصى 5 ثواني) عشان Streamlit ما يعملش Timeout
+                for _ in range(10):
+                    if is_server_running():
+                        break
+                    time.sleep(0.5)
         st.session_state.server_started = True
 
     st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
