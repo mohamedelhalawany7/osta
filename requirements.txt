@@ -28,6 +28,5 @@ pinecone-client
 pypdf
 firebase-admin
 google-generativeai
-python-magic
 streamlit
 requests
