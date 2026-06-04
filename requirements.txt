@@ -1,11 +1,11 @@
-streamlit==1.41.1
+streamlit
 firebase-admin
 bcrypt
 cryptography
 openai
-pinecone-client
+pinecone-client==5.3.1
+langchain-pinecone>=0.2.0
 pypdf
 langchain-openai
-langchain-pinecone
 langchain-anthropic
 langchain-google-genai
