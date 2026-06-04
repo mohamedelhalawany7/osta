@@ -131,18 +131,22 @@ if IS_PRODUCTION:
 else:
     SQLALCHEMY_DATABASE_URL = Vault.get_secret("DATABASE_URL", "sqlite+aiosqlite:///./workshop_db.sqlite")
 
-# إعدادات متقدمة لحماية الذاكرة (Memory Protection) ومنع انهيار قواعد البيانات المجانية
-engine_kwargs = {"echo": False}
-if not SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
-    engine_kwargs.update({
-        "pool_size": int(Vault.get_secret("DB_POOL_SIZE", 5)),       # حد أقصى للاتصالات المتزامنة لعدم إرهاق السيرفر المجاني
-        "max_overflow": int(Vault.get_secret("DB_MAX_OVERFLOW", 10)),# أقصى اتصالات إضافية وقت الضغط
-        "pool_recycle": 1800,                                        # تجديد الاتصال كل 30 دقيقة لتفادي انقطاع (Timeout) السيرفرات السحابية
-        "pool_pre_ping": True                                        # فحص سلامة الاتصال قبل إرسال الاستعلام لمنع انهيار التطبيق
-    })
+# استخدام كاش Streamlit لمنع استنزاف الاتصالات بقاعدة البيانات مع كل تحديث للواجهة
+@st.cache_resource
+def get_db_setup(_db_url):
+    engine_kwargs = {"echo": False}
+    if not _db_url.startswith("sqlite"):
+        engine_kwargs.update({
+            "pool_size": int(Vault.get_secret("DB_POOL_SIZE", 5)),       
+            "max_overflow": int(Vault.get_secret("DB_MAX_OVERFLOW", 10)),
+            "pool_recycle": 1800,                                        
+            "pool_pre_ping": True                                        
+        })
+    _engine = create_async_engine(_db_url, **engine_kwargs)
+    _SessionLocal = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
+    return _engine, _SessionLocal
 
-engine = create_async_engine(SQLALCHEMY_DATABASE_URL, **engine_kwargs)
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+engine, AsyncSessionLocal = get_db_setup(SQLALCHEMY_DATABASE_URL)
 Base = declarative_base()
 
 # --- تهيئة Firebase السحابية كخيار موازي وجاهز للاستخدام ---
@@ -475,7 +479,12 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     yield
     scheduler.shutdown()
-    await engine.dispose()
+    
+    # تفريغ قاعدة البيانات عند إغلاق التطبيق
+    try:
+        await engine.dispose()
+    except Exception:
+        pass
 
 app = FastAPI(title="Workshop Kiosk AI", lifespan=lifespan)
 
@@ -2191,9 +2200,14 @@ if __name__ == "__main__":
     if "server_started" not in st.session_state:
         if not is_server_running():
             def run_server():
-                config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
-                server = uvicorn.Server(config)
-                server.run()
+                try:
+                    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+                    server = uvicorn.Server(config)
+                    # ✅ الحل السحري: منع uvicorn من التلاعب بإشارات النظام لتفادي الانهيار في الخيوط الفرعية
+                    server.install_signal_handlers = lambda: None
+                    server.run()
+                except Exception as e:
+                    logger.error(f"Failed to start backend server: {e}")
 
             with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
                 t = threading.Thread(target=run_server, daemon=True)
