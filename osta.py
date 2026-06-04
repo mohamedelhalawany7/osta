@@ -21,17 +21,12 @@ import asyncio
 import secrets
 from cachetools import TTLCache
 import socket
-import subprocess
+import threading
 import streamlit as st
 import requests
 
-try:
-    import magic
-    MAGIC_AVAILABLE = True
-except ImportError:
-    import mimetypes
-    MAGIC_AVAILABLE = False
-    print("تنبيه: مكتبة python-magic أو ملفات DLL الخاصة بها غير متوافقة أو مفقودة. سيتم استخدام mimetypes كبديل.")
+import mimetypes
+import filetype
 
 import uvicorn
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, HTTPException, status, BackgroundTasks, Response
@@ -1452,11 +1447,15 @@ async def upload_rag_api(request: Request, background_tasks: BackgroundTasks, fi
             content = await file.read()
             if len(content) > MAX_FILE_SIZE: return RedirectResponse(url="/data_management?msg=error_size", status_code=303)
             try:
-                if MAGIC_AVAILABLE: mime_type = magic.from_buffer(content, mime=True)
+                kind = filetype.guess(content)
+                if kind:
+                    mime_type = kind.mime
                 else:
                     mime_type, _ = mimetypes.guess_type(file.filename)
                     if not mime_type: mime_type = "application/octet-stream"
-                if mime_type not in ["application/pdf", "text/plain"]: return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
+                
+                if mime_type not in ["application/pdf", "text/plain"]: 
+                    return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
             except Exception:
                 if not (file.filename.lower().endswith('.pdf') or file.filename.lower().endswith('.txt')):
                      return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
@@ -2183,23 +2182,28 @@ async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSessi
 # واجهة Streamlit السحرية (تم دمج واجهة الكشك الأصلية هنا بالكامل)
 # =====================================================================
 if __name__ == "__main__":
+    st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
+
     def is_server_running(port=8000):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             return s.connect_ex(('127.0.0.1', port)) == 0
 
     if "server_started" not in st.session_state:
         if not is_server_running():
+            def run_server():
+                config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
+                server = uvicorn.Server(config)
+                server.run()
+
             with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
-                module_name = os.path.splitext(os.path.basename(__file__))[0]
-                subprocess.Popen([sys.executable, "-m", "uvicorn", f"{module_name}:app", "--host", "127.0.0.1", "--port", "8000"])
-                # الانتظار الذكي: نفحص كل نصف ثانية
+                t = threading.Thread(target=run_server, daemon=True)
+                t.start()
                 for _ in range(10):
                     if is_server_running():
                         break
                     time.sleep(0.5)
         st.session_state.server_started = True
 
-    st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
     API_BASE = "http://127.0.0.1:8000"
     
     # تنسيقات الواجهة لتشبه واجهة الكشك الأصلية
