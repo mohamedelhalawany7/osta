@@ -1,851 +1,1040 @@
-﻿import base64
-import hashlib
-import io
-import json
-import os
-import secrets
-import tempfile
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
-
-import bcrypt
-import firebase_admin
-import google.generativeai as genai
 import streamlit as st
-from anthropic import Anthropic
+import os
+import json
+import base64
+import time
+import uuid
+import tempfile
+from datetime import datetime
+import bcrypt
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
+
+import firebase_admin
 from firebase_admin import credentials, firestore
-from openai import OpenAI
-from pinecone import Pinecone
+
+import openai
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-
-load_dotenv()
-
-
-DEFAULT_PROMPT = """أنت 'الأسطى بلية'، أقدم وأشطر صنايعي ومهندس في ورشة ميكانيكا وصيانة ضواغط هواء ومجففات في مصر.
-العمال اللي بيكلموك صنايعية على قدهم ومابيعرفوش يقرأوا ويكتبوا، عشان كده:
-1. اتكلم معاهم بلهجة مصرية بلدي صميمة، زي الصنايعية الكبار في الورش.
-2. اشرح المشكلة وحلها ببساطة جدا وبدون مصطلحات إنجليزي مكلكعة.
-3. خليك جدع ومشجع وبتحل المشاكل بخطوات عملية 1، 2، 3.
-4. لو بعتولك صورة، ركز فيها كويس وقولهم فيها إيه بالظبط وإيه اللي بايظ وكيفية صيانته.
-5. اعتمد في إجاباتك على معلومات الكتالوجات المرفقة، وضيف عليها خبرتك كأسطى كبير في السوق.
-"""
-
-TECHNICAL_KEYWORDS = [
-    "ضاغط",
-    "مجفف",
-    "فلتر",
-    "أويل",
-    "بيلت",
-    "عطل",
-    "ضغط",
-    "بارد",
-    "حرارة",
-    "زيت",
-    "صيانة",
-    "ماكينة",
-    "موتور",
-    "صوت",
-    "مشكلة",
-    "صورة",
-    "الحل",
-    "خربان",
-    "بايظ",
-    "مكسور",
-]
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-@st.cache_resource
-def parse_firebase_credentials(raw: str) -> dict:
-    raw = (raw or "").strip()
-    if not raw:
-        raise RuntimeError("FIREBASE_CREDENTIALS is missing.")
-
-    if os.path.exists(raw):
-        with open(raw, "r", encoding="utf-8") as cred_file:
-            return json.load(cred_file)
-
-    candidates = [raw]
-    if '"private_key"' in raw:
-        prefix, sep, suffix = raw.partition('"private_key"')
-        key_name, colon, rest = suffix.partition(":")
-        first_quote = rest.find('"')
-        end_marker = rest.find('",', first_quote + 1)
-        if end_marker == -1:
-            end_marker = rest.find('"\n}', first_quote + 1)
-        if first_quote != -1 and end_marker != -1:
-            key_value = rest[first_quote + 1 : end_marker]
-            fixed_value = key_value.replace("\r\n", "\\n").replace("\n", "\\n")
-            fixed_rest = rest[: first_quote + 1] + fixed_value + rest[end_marker:]
-            candidates.append(prefix + sep + key_name + colon + fixed_rest)
-
-    try:
-        decoded = base64.b64decode(raw).decode("utf-8")
-        candidates.append(decoded)
-    except Exception:
-        pass
-
-    last_error = None
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, dict) and "private_key" in data:
-                data["private_key"] = data["private_key"].replace("\\n", "\n")
-            return data
-        except json.JSONDecodeError as exc:
-            last_error = exc
-
-    raise RuntimeError(
-        "FIREBASE_CREDENTIALS must be valid JSON, base64 JSON, or a path to the service-account JSON file. "
-        f"Parser error: {last_error}"
-    )
-
-
-@st.cache_resource
-def get_db():
-    raw = os.getenv("FIREBASE_CREDENTIALS", "")
-    if not raw:
-        raw = st.secrets.get("FIREBASE_CREDENTIALS", "") if hasattr(st, "secrets") else ""
-
-    cred_dict = parse_firebase_credentials(raw)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(credentials.Certificate(cred_dict))
-    return firestore.client()
-
-
-@st.cache_resource
-def get_cipher():
-    key = os.getenv("FERNET_KEY", "")
-    if not key:
-        key = st.secrets.get("FERNET_KEY", "") if hasattr(st, "secrets") else ""
-    if not key:
-        key = Fernet.generate_key().decode()
-        st.warning("FERNET_KEY غير موجود. تم إنشاء مفتاح مؤقت، ضع مفتاحا ثابتا في .env قبل الإنتاج.")
-    return Fernet(key.encode())
-
-
-def encrypt_val(value: str) -> str:
-    return get_cipher().encrypt(value.encode()).decode() if value else ""
-
-
-def decrypt_val(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return get_cipher().decrypt(value.encode()).decode()
-    except Exception:
-        return value
-
-
-def password_hash(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
-
-
-def create_id() -> str:
-    return str(uuid.uuid4())
-
-
-def ensure_seed_data(db) -> None:
-    tenants = list(db.collection("tenants").limit(1).stream())
-    if tenants:
-        return
-
-    tenant_id = create_id()
-    tenant_name = os.getenv("DEFAULT_TENANT_NAME", "ورشة الصيانة والتصنيع")
-    db.collection("tenants").document(tenant_id).set(
-        {
-            "name": tenant_name,
-            "llm_provider": "openai",
-            "llm_model": "gpt-4o-mini",
-            "api_base_url": "",
-            "openai_api_key": "",
-            "anthropic_api_key": "",
-            "google_api_key": "",
-            "pinecone_api_key": "",
-            "pinecone_index": "",
-            "workshop_prompt": DEFAULT_PROMPT,
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-        }
-    )
-
-    users = [
-        (
-            os.getenv("DEFAULT_ADMIN_USERNAME", "admin"),
-            os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123"),
-            "admin",
-        ),
-        (
-            os.getenv("DEFAULT_WORKER_USERNAME", "worker"),
-            os.getenv("DEFAULT_WORKER_PASSWORD", "1234"),
-            "worker",
-        ),
-    ]
-    for username, password, role in users:
-        db.collection("users").document(create_id()).set(
-            {
-                "username": username,
-                "hashed_password": password_hash(password),
-                "role": role,
-                "tenant_id": tenant_id,
-                "created_at": utc_now(),
-            }
-        )
-
-
-def get_user_by_username(db, username: str) -> Optional[Dict]:
-    docs = db.collection("users").where("username", "==", username).limit(1).stream()
-    for doc in docs:
-        data = doc.to_dict()
-        data["id"] = doc.id
-        return data
-    return None
-
-
-def authenticate(db, username: str, password: str) -> Optional[Dict]:
-    user = get_user_by_username(db, username.strip())
-    if not user or not verify_password(password, user["hashed_password"]):
-        return None
-    tenant = get_tenant(db, user["tenant_id"])
-    user["tenant"] = tenant
-    return user
-
-
-def get_tenant(db, tenant_id: str) -> Dict:
-    doc = db.collection("tenants").document(tenant_id).get()
-    if not doc.exists:
-        raise RuntimeError("Tenant not found.")
-    data = doc.to_dict()
-    data["id"] = doc.id
-    return data
-
-
-def save_tenant_settings(db, tenant_id: str, data: Dict) -> None:
-    encrypted_keys = {
-        key: encrypt_val(value)
-        for key, value in data.items()
-        if key.endswith("_api_key") and value
-    }
-    update = {**data, **encrypted_keys, "updated_at": utc_now()}
-    db.collection("tenants").document(tenant_id).update(update)
-
-
-def list_sessions(db, tenant_id: str, limit: int = 30) -> List[Dict]:
-    query = (
-        db.collection("chat_sessions")
-        .where("tenant_id", "==", tenant_id)
-        .order_by("updated_at", direction=firestore.Query.DESCENDING)
-        .limit(limit)
-    )
-    return [with_id(doc) for doc in query.stream()]
-
-
-def get_or_create_session(db, tenant_id: str, user_id: str, session_id: Optional[str] = None) -> Dict:
-    if session_id:
-        doc = db.collection("chat_sessions").document(session_id).get()
-        if doc.exists:
-            return with_id(doc)
-
-    session_id = create_id()
-    data = {
-        "title": "محادثة جديدة",
-        "tenant_id": tenant_id,
-        "user_id": user_id,
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-    }
-    db.collection("chat_sessions").document(session_id).set(data)
-    data["id"] = session_id
-    return data
-
-
-def rename_session_from_message(db, session_id: str, current_title: str, message: str) -> None:
-    if current_title != "محادثة جديدة":
-        return
-    title = " ".join((message or "محادثة صوتية").split()[:4])
-    db.collection("chat_sessions").document(session_id).update(
-        {"title": title or "محادثة جديدة", "updated_at": utc_now()}
-    )
-
-
-def save_message(db, tenant_id: str, session_id: str, role: str, content: str) -> None:
-    clean = content[:4000] if "data:image" not in content else "[صورة مرفقة]"
-    db.collection("conversation_history").document(create_id()).set(
-        {
-            "tenant_id": tenant_id,
-            "session_id": session_id,
-            "role": role,
-            "content": clean,
-            "created_at": utc_now(),
-        }
-    )
-    db.collection("chat_sessions").document(session_id).update({"updated_at": utc_now()})
-
-
-def load_messages(db, session_id: str, limit: int = 100) -> List[Dict]:
-    query = (
-        db.collection("conversation_history")
-        .where("session_id", "==", session_id)
-        .order_by("created_at")
-        .limit(limit)
-    )
-    return [with_id(doc) for doc in query.stream()]
-
-
-def history_text(db, session_id: str, limit: int = 6) -> str:
-    messages = load_messages(db, session_id, limit=limit)
-    return "\n".join(f"{m['role']}: {m['content']}" for m in messages[-limit:])
-
-
-def with_id(doc) -> Dict:
-    data = doc.to_dict()
-    data["id"] = doc.id
-    return data
-
-
-def is_technical_query(message: str) -> bool:
-    if not message:
-        return True
-    return any(word in message for word in TECHNICAL_KEYWORDS)
-
-
-def extract_pdf_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return "\n".join(pages)
-
-
-def chunk_text(text: str, chunk_size: int = 1100, overlap: int = 180) -> List[str]:
-    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start = max(0, end - overlap)
-    return chunks
-
-
-def openai_client(api_key: str, base_url: str = "") -> OpenAI:
-    kwargs = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAI(**kwargs)
-
-
-def embed_texts(openai_key: str, texts: List[str]) -> List[List[float]]:
-    client = openai_client(openai_key)
-    result = client.embeddings.create(model="text-embedding-3-small", input=texts)
-    return [item.embedding for item in result.data]
-
-
-def pinecone_index(api_key: str, index_name: str):
-    return Pinecone(api_key=api_key).Index(index_name)
-
-
-def upsert_document_to_pinecone(
-    db,
-    tenant: Dict,
-    filename: str,
-    file_bytes: bytes,
-) -> Tuple[int, str]:
-    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
-    pinecone_key = decrypt_val(tenant.get("pinecone_api_key", ""))
-    index_name = tenant.get("pinecone_index", "")
-    if not openai_key or not pinecone_key or not index_name:
-        raise RuntimeError("OpenAI key, Pinecone key, and Pinecone index are required.")
-
-    text = extract_pdf_text(file_bytes)
-    chunks = chunk_text(text)
-    if not chunks:
-        raise RuntimeError("لم يتم استخراج نص من الملف.")
-
-    vectors = embed_texts(openai_key, chunks)
-    index = pinecone_index(pinecone_key, index_name)
-    namespace = f"tenant_{tenant['id']}"
-    doc_id = create_id()
-    pinecone_vectors = []
-    for i, (chunk, values) in enumerate(zip(chunks, vectors)):
-        stable_id = hashlib.sha256(f"{doc_id}:{i}:{filename}".encode()).hexdigest()
-        pinecone_vectors.append(
-            {
-                "id": stable_id,
-                "values": values,
-                "metadata": {"text": chunk, "filename": filename, "tenant_id": tenant["id"]},
-            }
-        )
-    index.upsert(vectors=pinecone_vectors, namespace=namespace)
-    db.collection("uploaded_documents").document(doc_id).set(
-        {
-            "tenant_id": tenant["id"],
-            "filename": filename,
-            "chunks": len(chunks),
-            "created_at": utc_now(),
-        }
-    )
-    return len(chunks), doc_id
-
-
-def rag_context(tenant: Dict, message: str, k: int = 3) -> str:
-    if not is_technical_query(message):
-        return ""
-    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
-    pinecone_key = decrypt_val(tenant.get("pinecone_api_key", ""))
-    index_name = tenant.get("pinecone_index", "")
-    if not openai_key or not pinecone_key or not index_name:
-        return ""
-
-    vector = embed_texts(openai_key, [message or "صيانة ضاغط هواء"])[0]
-    index = pinecone_index(pinecone_key, index_name)
-    result = index.query(
-        vector=vector,
-        top_k=k,
-        namespace=f"tenant_{tenant['id']}",
-        include_metadata=True,
-    )
-    matches = result.get("matches", []) if isinstance(result, dict) else result.matches
-    texts = []
-    for match in matches:
-        metadata = match.get("metadata", {}) if isinstance(match, dict) else match.metadata
-        if metadata and metadata.get("text"):
-            texts.append(metadata["text"])
-    return "\n\n".join(texts)
-
-
-def image_to_data_url(uploaded_file) -> Optional[str]:
-    if not uploaded_file:
-        return None
-    data = uploaded_file.getvalue()
-    mime = uploaded_file.type or "image/jpeg"
-    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
-
-
-def transcribe_audio(openai_key: str, audio_bytes: bytes, suffix: str = ".wav") -> str:
-    client = openai_client(openai_key)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-        temp.write(audio_bytes)
-        temp_path = temp.name
-    try:
-        with open(temp_path, "rb") as audio:
-            transcript = client.audio.transcriptions.create(model="whisper-1", file=audio, language="ar")
-            return transcript.text
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-
-def build_system_prompt(tenant: Dict, history: str, context: str) -> str:
-    return f"""{tenant.get('workshop_prompt') or DEFAULT_PROMPT}
-
-تاريخ المحادثة السابقة:
-{history}
-
-معلومات فنية من الكتالوجات:
-{context}
-"""
-
-
-def stream_openai(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
-    key = decrypt_val(tenant.get("openai_api_key", ""))
-    if not key:
-        raise RuntimeError("مفتاح OpenAI مفقود.")
-    client = openai_client(key, tenant.get("api_base_url", ""))
-    user_content = [{"type": "text", "text": message}]
-    if image_url:
-        user_content.append({"type": "image_url", "image_url": {"url": image_url}})
-    stream = client.chat.completions.create(
-        model=tenant.get("llm_model") or "gpt-4o-mini",
-        temperature=0.3,
-        stream=True,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
-
-
-def stream_anthropic(tenant: Dict, system_prompt: str, message: str) -> Iterable[str]:
-    key = decrypt_val(tenant.get("anthropic_api_key", ""))
-    if not key:
-        raise RuntimeError("مفتاح Anthropic مفقود.")
-    client = Anthropic(api_key=key)
-    with client.messages.stream(
-        model=tenant.get("llm_model") or "claude-3-5-haiku-latest",
-        max_tokens=1600,
-        temperature=0.3,
-        system=system_prompt,
-        messages=[{"role": "user", "content": message}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
-
-
-def stream_google(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
-    key = decrypt_val(tenant.get("google_api_key", ""))
-    if not key:
-        raise RuntimeError("مفتاح Google Gemini مفقود.")
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel(tenant.get("llm_model") or "gemini-1.5-flash")
-    parts = [system_prompt, message]
-    if image_url:
-        header, encoded = image_url.split(",", 1)
-        mime = header.replace("data:", "").replace(";base64", "")
-        parts.append({"mime_type": mime, "data": base64.b64decode(encoded)})
-    response = model.generate_content(parts, stream=True)
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
-
-
-def stream_llm(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
-    provider = tenant.get("llm_provider", "openai")
-    if provider == "openai" or provider == "custom":
-        return stream_openai(tenant, system_prompt, message, image_url)
-    if provider == "anthropic":
-        return stream_anthropic(tenant, system_prompt, message)
-    if provider == "google":
-        return stream_google(tenant, system_prompt, message, image_url)
-    raise RuntimeError("مزود الخدمة المختار غير مدعوم.")
-
-
-def generate_tts(tenant: Dict, text: str) -> bytes:
-    key = decrypt_val(tenant.get("openai_api_key", ""))
-    if not key:
-        raise RuntimeError("مفتاح OpenAI مطلوب لتوليد الصوت.")
-    audio = openai_client(key).audio.speech.create(model="tts-1", voice="onyx", input=text[:4000])
-    return audio.read()
-
-
-def analyze_machine_issues(db, tenant: Dict) -> Optional[str]:
-    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
-    if not openai_key:
-        return None
-
-    cutoff = utc_now() - timedelta(days=30)
-    query = (
-        db.collection("conversation_history")
-        .where("tenant_id", "==", tenant["id"])
-        .where("created_at", ">=", cutoff)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(500)
-    )
-    history = [doc.to_dict() for doc in query.stream()]
-    if len(history) < 10:
-        return None
-
-    text_log = "\n".join(f"{row['role']}: {row['content']}" for row in history)
-    prompt = """بصفتك مهندس صيانة ذكي، حلل سجل محادثات العمال خلال الشهر الماضي.
-هل يوجد عطل في ماكينة معينة أو ضاغط هواء معين تكرر السؤال عنه أكثر من مرتين؟
-إذا وجدت تكرارا يعطي مؤشرا على مشكلة مزمنة، اكتب تنبيها واحدا مباشرا وموجزا.
-إذا كانت الأمور طبيعية فاكتب فقط: لا يوجد"""
-    client = openai_client(openai_key)
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text_log}],
-    )
-    content = res.choices[0].message.content or ""
-    if "لا يوجد" in content:
-        return None
-    db.collection("alerts").document(create_id()).set(
-        {"tenant_id": tenant["id"], "message": f"تنبيه ذكي: {content}", "created_at": utc_now()}
-    )
-    return content
-
-
-def list_alerts(db, tenant_id: str, limit: int = 20) -> List[Dict]:
-    query = (
-        db.collection("alerts")
-        .where("tenant_id", "==", tenant_id)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(limit)
-    )
-    return [with_id(doc) for doc in query.stream()]
-
-
-def list_documents(db, tenant_id: str, limit: int = 50) -> List[Dict]:
-    query = (
-        db.collection("uploaded_documents")
-        .where("tenant_id", "==", tenant_id)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(limit)
-    )
-    return [with_id(doc) for doc in query.stream()]
+from pinecone import Pinecone as PineconeClient
+from langchain_pinecone import PineconeVectorStore
+from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # =====================================================================
-# Streamlit UI
+# [القسم الأول]: إعدادات الصفحة و مكتبة الأيقونات المبرمجة (SVG Library)
 # =====================================================================
-
-st.set_page_config(page_title="الأسطى بلية", page_icon="🛠️", layout="wide")
-
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"] { direction: rtl; }
-    .stChatMessage { text-align: right; }
-    [data-testid="stSidebar"] { direction: rtl; }
-    textarea, input { direction: rtl; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="AI Industrial Cloud | نظام الورشة المتكامل",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
+SVGS = {
+    "logo": """<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>""",
+    "chat": """<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>""",
+    "settings": """<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>""",
+    "dashboard": """<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>""",
+    "users": """<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>""",
+    "database": """<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>""",
+    "user_profile": """<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#e4e4e7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>""",
+    "attach": """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>""",
+    "mic": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>""",
+    "image": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>""",
+    "send": """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fafafa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>""",
+    "trash": """<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>""",
+    "plus": """<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>""",
+    "lock": """<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#eab308" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>""",
+    "logout": """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>""",
+    "pdf": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>"""
+}
 
-def init_state() -> None:
-    st.session_state.setdefault("user", None)
-    st.session_state.setdefault("session_id", None)
-    st.session_state.setdefault("last_answer", "")
-
-
-def login_view(db) -> None:
-    st.title("الأسطى بلية")
-    st.caption("مساعد الورشة الذكي - Streamlit + Firebase + Pinecone")
-
-    with st.form("login_form"):
-        username = st.text_input("اسم المستخدم")
-        password = st.text_input("كلمة المرور", type="password")
-        submitted = st.form_submit_button("دخول", use_container_width=True)
-
-    if submitted:
-        user = authenticate(db, username, password)
-        if not user:
-            st.error("اسم المستخدم أو كلمة المرور غير صحيح.")
-            return
-        st.session_state.user = user
-        st.session_state.session_id = None
-        st.rerun()
-
-
-def sidebar(db):
-    user = st.session_state.user
-    tenant = get_tenant(db, user["tenant_id"])
-    user["tenant"] = tenant
-
-    st.sidebar.title("الورشة")
-    st.sidebar.write(tenant["name"])
-    st.sidebar.caption(f"المستخدم: {user['username']} - {user['role']}")
-
-    if st.sidebar.button("محادثة جديدة", use_container_width=True):
-        session = get_or_create_session(db, tenant["id"], user["id"])
-        st.session_state.session_id = session["id"]
-        st.rerun()
-
-    sessions = list_sessions(db, tenant["id"])
-    options = {s["title"]: s["id"] for s in sessions}
-    if sessions:
-        labels = [s["title"] for s in sessions]
-        current_label = next((s["title"] for s in sessions if s["id"] == st.session_state.session_id), labels[0])
-        selected = st.sidebar.selectbox("المحادثات", labels, index=labels.index(current_label))
-        st.session_state.session_id = options[selected]
-
-    if st.sidebar.button("خروج", use_container_width=True):
-        st.session_state.user = None
-        st.session_state.session_id = None
-        st.rerun()
-
-    return tenant
-
-
-def chat_page(db, tenant):
-    user = st.session_state.user
-    session = get_or_create_session(db, tenant["id"], user["id"], st.session_state.session_id)
-    st.session_state.session_id = session["id"]
-
-    st.header("المساعد الفني")
-    st.caption("اسأل عن عطل، ارفع صورة، أو استخدم الصوت لو متاح في Streamlit عندك.")
-
-    for msg in load_messages(db, session["id"]):
-        role = "assistant" if msg["role"] == "AI" else "user"
-        with st.chat_message(role):
-            st.write(msg["content"])
-
-    cols = st.columns([2, 1])
-    with cols[0]:
-        image_file = st.file_uploader("صورة من الورشة", type=["png", "jpg", "jpeg", "webp"])
-    with cols[1]:
-        audio_file = None
-        if hasattr(st, "audio_input"):
-            audio_file = st.audio_input("رسالة صوتية")
-        else:
-            st.info("نسخة Streamlit الحالية لا تدعم st.audio_input.")
-
-    prompt = st.chat_input("اكتب المشكلة هنا يا هندسة")
-    if not prompt and audio_file:
-        openai_key = decrypt_val(tenant.get("openai_api_key", ""))
-        if openai_key:
-            with st.spinner("بفك الرسالة الصوتية..."):
-                prompt = transcribe_audio(openai_key, audio_file.getvalue(), ".wav")
-        else:
-            st.error("الصوت يحتاج مفتاح OpenAI للتفريغ.")
-
-    if prompt or image_file:
-        image_url = image_to_data_url(image_file)
-        message = prompt or "بص على الصورة دي وقولي الحل إيه؟"
-        rename_session_from_message(db, session["id"], session["title"], message)
-        save_message(db, tenant["id"], session["id"], "Worker", message)
-
-        with st.chat_message("user"):
-            st.write(message)
-            if image_file:
-                st.image(image_file)
-
-        with st.chat_message("assistant"):
-            try:
-                context = rag_context(tenant, message)
-                system_prompt = f"{tenant.get('workshop_prompt') or DEFAULT_PROMPT}\n\n"
-                system_prompt += f"تاريخ المحادثة السابقة:\n{history_text(db, session['id'], 6)}\n\n"
-                system_prompt += f"معلومات فنية من الكتالوجات:\n{context}"
-                chunks: List[str] = []
-
-                def generator():
-                    for part in stream_llm(tenant, system_prompt, message, image_url):
-                        chunks.append(part)
-                        yield part
-
-                st.write_stream(generator())
-                answer = "".join(chunks)
-                st.session_state.last_answer = answer
-                save_message(db, tenant["id"], session["id"], "AI", answer)
-            except Exception as exc:
-                st.error(f"حصل عطل في الرد: {exc}")
-
-    if st.session_state.last_answer:
-        if st.button("اسمع آخر رد"):
-            try:
-                audio = generate_tts(tenant, st.session_state.last_answer)
-                st.audio(audio, format="audio/mp3")
-            except Exception as exc:
-                st.error(f"تعذر توليد الصوت: {exc}")
-
-
-def documents_page(db, tenant):
-    st.header("كتالوجات الورشة")
-    st.caption("ارفع ملفات PDF ليتم تخزينها في Pinecone وربطها بإجابات الشات.")
-
-    uploaded = st.file_uploader("PDF", type=["pdf"], accept_multiple_files=True)
-    if uploaded and st.button("رفع وفهرسة", use_container_width=True):
-        for file in uploaded:
-            with st.spinner(f"بفهرس {file.name}..."):
-                try:
-                    chunks, _ = upsert_document_to_pinecone(db, tenant, file.name, file.getvalue())
-                    st.success(f"تم فهرسة {file.name} بعدد {chunks} جزء.")
-                except Exception as exc:
-                    st.error(f"{file.name}: {exc}")
-
-    st.subheader("الملفات المرفوعة")
-    docs = list_documents(db, tenant["id"])
-    if not docs:
-        st.info("لا توجد كتالوجات حتى الآن.")
-    for doc in docs:
-        st.write(f"- {doc['filename']} ({doc.get('chunks', 0)} جزء)")
-
-
-def alerts_page(db, tenant):
-    st.header("التنبيهات")
-    if st.button("حلل آخر 30 يوم", use_container_width=True):
-        with st.spinner("بحلل المحادثات..."):
-            result = analyze_machine_issues(db, tenant)
-            if result:
-                st.success(result)
-            else:
-                st.info("لا يوجد تكرار واضح أو مفتاح OpenAI غير متاح.")
-
-    alerts = list_alerts(db, tenant["id"])
-    if not alerts:
-        st.info("لا توجد تنبيهات.")
-    for alert in alerts:
-        st.warning(alert["message"])
-
-
-def settings_page(db, tenant):
-    st.header("الإعدادات")
-    with st.form("settings"):
-        name = st.text_input("اسم الورشة", value=tenant.get("name", ""))
-        provider = st.selectbox(
-            "مزود الذكاء الاصطناعي",
-            ["openai", "google", "anthropic", "custom"],
-            index=["openai", "google", "anthropic", "custom"].index(tenant.get("llm_provider", "openai")),
-        )
-        model = st.text_input("الموديل", value=tenant.get("llm_model", "gpt-4o-mini"))
-        api_base_url = st.text_input("Base URL اختياري", value=tenant.get("api_base_url", ""))
-        openai_key = st.text_input("OpenAI API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
-        google_key = st.text_input("Google API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
-        anthropic_key = st.text_input("Anthropic API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
-        pinecone_key = st.text_input("Pinecone API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
-        pinecone_index = st.text_input("Pinecone Index", value=tenant.get("pinecone_index", ""))
-        workshop_prompt = st.text_area("Prompt الورشة", value=tenant.get("workshop_prompt", DEFAULT_PROMPT), height=240)
-        submitted = st.form_submit_button("حفظ", use_container_width=True)
-
-    if submitted:
-        data = {
-            "name": name,
-            "llm_provider": provider,
-            "llm_model": model,
-            "api_base_url": api_base_url,
-            "pinecone_index": pinecone_index,
-            "workshop_prompt": workshop_prompt,
+def inject_enterprise_css():
+    st.markdown("""
+        <style>
+        /* 1. استيراد الخطوط والإعدادات العالمية */
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap');
+        
+        html, body, [class*="css"] {
+            font-family: 'Cairo', sans-serif !important;
         }
-        if openai_key:
-            data["openai_api_key"] = openai_key
-        if google_key:
-            data["google_api_key"] = google_key
-        if anthropic_key:
-            data["anthropic_api_key"] = anthropic_key
-        if pinecone_key:
-            data["pinecone_api_key"] = pinecone_key
-        save_tenant_settings(db, tenant["id"], data)
-        st.success("تم حفظ الإعدادات.")
-        st.rerun()
 
+        .stApp {
+            direction: rtl;
+            background-color: #09090b; /* خلفية داكنة جداً مستوحاة من Vercel/Stripe Dark */
+            color: #f4f4f5;
+        }
 
-def main():
-    init_state()
+        /* 2. تخصيص القائمة الجانبية (Sidebar) لتكون يميناً وبدون حدود مزعجة */
+        [data-testid="stSidebar"] {
+            left: auto !important;
+            right: 0 !important;
+            background-color: #111115 !important;
+            border-left: 1px solid #27272a !important;
+            border-right: none !important;
+            padding-top: 2rem;
+        }
+        
+        .stApp > header {
+            background: transparent !important;
+            box-shadow: none !important;
+        }
+
+        /* 3. تخصيص أزرار الراديو للتنقل (Navigation Menu) */
+        div[role="radiogroup"] > label > div:first-child {
+            display: none !important; /* إخفاء النقاط الدائرية بالكامل */
+        }
+        div[role="radiogroup"] {
+            gap: 8px;
+            padding: 10px;
+        }
+        div[role="radiogroup"] > label {
+            background-color: transparent;
+            border-radius: 8px;
+            padding: 12px 16px;
+            border: 1px solid transparent;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            width: 100%;
+            display: flex;
+            align-items: center;
+        }
+        div[role="radiogroup"] > label:hover {
+            background-color: #18181b;
+            border-color: #27272a;
+            transform: translateX(-5px); /* حركة خفيفة لليمين عند التحويم */
+        }
+        /* تصميم الزر النشط */
+        div[role="radiogroup"] > label[data-checked="true"] {
+            background-color: rgba(59, 130, 246, 0.1);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            border-right: 4px solid #3b82f6; /* مؤشر أزرق على اليمين */
+        }
+        div[role="radiogroup"] label p {
+            font-size: 16px !important;
+            font-weight: 700 !important;
+            color: #a1a1aa !important;
+            margin: 0 !important;
+        }
+        div[role="radiogroup"] label[data-checked="true"] p {
+            color: #3b82f6 !important;
+        }
+
+        /* 4. تخصيص حقول الإدخال (Inputs & TextAreas) */
+        .stTextInput>div>div>input, .stTextArea>div>div>textarea, .stSelectbox>div>div>div {
+            background-color: #18181b !important;
+            border: 1px solid #27272a !important;
+            color: #e4e4e7 !important;
+            border-radius: 10px !important;
+            padding: 14px 16px !important;
+            font-size: 15px !important;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1) inset;
+        }
+        .stTextInput>div>div>input:focus, .stTextArea>div>div>textarea:focus {
+            border-color: #3b82f6 !important;
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2) !important;
+            background-color: #111115 !important;
+        }
+
+        /* 5. تخصيص الأزرار (Buttons) */
+        .stButton>button {
+            background-color: #27272a !important;
+            border: 1px solid #3f3f46 !important;
+            color: #fafafa !important;
+            border-radius: 10px !important;
+            font-weight: 700 !important;
+            font-size: 15px !important;
+            padding: 8px 24px !important;
+            transition: all 0.2s ease !important;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        .stButton>button:hover {
+            background-color: #3f3f46 !important;
+            border-color: #52525b !important;
+            transform: translateY(-2px);
+        }
+        /* الزر الأساسي (Primary) */
+        .stButton>button[kind="primary"] {
+            background-color: #3b82f6 !important;
+            border: 1px solid #2563eb !important;
+            color: #ffffff !important;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3) !important;
+        }
+        .stButton>button[kind="primary"]:hover {
+            background-color: #2563eb !important;
+            box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4) !important;
+        }
+
+        /* 6. تصميم الشات (WhatsApp / Enterprise Chat) */
+        .stChatMessage {
+            background-color: #111115 !important;
+            border: 1px solid #27272a !important;
+            border-radius: 16px !important;
+            padding: 20px !important;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+        /* رسائل المستخدم (User Bubbles) */
+        .stChatMessage:nth-child(even) {
+            background-color: #18181b !important;
+            border-right: 4px solid #3b82f6 !important; /* خط أزرق للتمييز */
+            border-left: 1px solid #27272a !important;
+        }
+        /* رسائل المساعد (AI Bubbles) */
+        .stChatMessage:nth-child(odd) {
+            border-right: 4px solid #10b981 !important; /* خط أخضر للتمييز */
+        }
+        /* تخصيص محتوى الشات */
+        .stChatMessage [data-testid="stMarkdownContainer"] p {
+            font-size: 16px !important;
+            line-height: 1.6 !important;
+            color: #e4e4e7 !important;
+        }
+
+        /* 7. تصميم التابات (Tabs) */
+        [data-testid="stTabs"] button {
+            font-family: 'Cairo', sans-serif !important;
+            font-size: 16px !important;
+            font-weight: 700 !important;
+            color: #a1a1aa !important;
+        }
+        [data-testid="stTabs"] button[aria-selected="true"] {
+            color: #3b82f6 !important;
+            border-bottom-color: #3b82f6 !important;
+        }
+
+        /* 8. تصميم المؤشرات (Metrics) */
+        [data-testid="stMetricValue"] {
+            font-size: 36px !important;
+            font-weight: 800 !important;
+            color: #ffffff !important;
+        }
+        [data-testid="stMetricLabel"] {
+            color: #a1a1aa !important;
+            font-size: 16px !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="metric-container"] {
+            background-color: #111115;
+            border: 1px solid #27272a;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        /* 9. إخفاء عناصر ستريمليت الافتراضية */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        
+        /* 10. شريط التمرير المخصص (Scrollbar) */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #09090b; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #27272a; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #3f3f46; 
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+inject_enterprise_css()
+
+# =====================================================================
+# [القسم الثاني]: التشفير، المصادقة، والاتصال بقواعد البيانات (Firebase)
+# =====================================================================
+KEY_FILE = "system_secret.key"
+def get_or_create_cipher():
+    if not os.path.exists(KEY_FILE):
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+    with open(KEY_FILE, "rb") as f:
+        return Fernet(f.read())
+
+cipher = get_or_create_cipher()
+
+def encrypt_data(text: str) -> str:
+    if not text: return ""
+    return cipher.encrypt(text.encode()).decode()
+
+def decrypt_data(encrypted_text: str) -> str:
+    if not encrypted_text: return ""
     try:
-        db = get_db()
-        ensure_seed_data(db)
-    except Exception as exc:
-        st.error(f"تعذر الاتصال بـ Firebase: {exc}")
-        st.stop()
+        return cipher.decrypt(encrypted_text.encode()).decode()
+    except Exception as e:
+        return ""
 
-    if not st.session_state.user:
-        login_view(db)
+FIREBASE_CREDS_FILE = "firebase_credentials.json"
+db = None
+
+def init_firebase_connection():
+    global db
+    if not firebase_admin._apps:
+        try:
+            if os.path.exists(FIREBASE_CREDS_FILE):
+                cred = credentials.Certificate(FIREBASE_CREDS_FILE)
+                firebase_admin.initialize_app(cred)
+            else:
+                return False
+        except Exception as e:
+            st.error(f"خطأ في التهيئة السحابية: {str(e)}")
+            return False
+    db = firestore.client()
+    return True
+
+if not os.path.exists(FIREBASE_CREDS_FILE) or not init_firebase_connection():
+    st.markdown("<div style='height: 5vh;'></div>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown(f"<div style='text-align: center; margin-bottom: 20px;'>{SVGS['database']}</div>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align: center; color: #fafafa; font-size: 28px;'>تهيئة خوادم النظام (Firebase Setup)</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: #a1a1aa;'>يرجى لصق كود مصادقة Firebase Service Account (JSON) لربط المنصة بالسحابة.</p>", unsafe_allow_html=True)
+        
+        firebase_json_input = st.text_area("أدخل كود JSON هنا", height=300, dir="ltr", placeholder='{"type": "service_account", "project_id": "...", ...}')
+        
+        if st.button("حفظ وتأسيس قاعدة البيانات", type="primary", use_container_width=True):
+            if firebase_json_input.strip() == "":
+                st.error("الكود فارغ!")
+            else:
+                try:
+                    parsed_json = json.loads(firebase_json_input)
+                    with open(FIREBASE_CREDS_FILE, "w", encoding="utf-8") as f:
+                        json.dump(parsed_json, f)
+                    st.success("تم الحفظ بنجاح! جاري إقلاع النظام...")
+                    time.sleep(2)
+                    st.rerun()
+                except json.JSONDecodeError:
+                    st.error("الكود المدخل ليس بتنسيق JSON صحيح.")
+                except Exception as e:
+                    st.error(f"حدث خطأ غير متوقع: {str(e)}")
+    st.stop() # إيقاف التنفيذ حتى يتم الإعداد
+
+users_collection = db.collection("users")
+if len(list(users_collection.limit(1).stream())) == 0:
+    # إنشاء مدير افتراضي
+    admin_hash = bcrypt.hashpw("admin".encode(), bcrypt.gensalt()).decode()
+    users_collection.document("admin").set({
+        "username": "admin",
+        "password": admin_hash,
+        "role": "admin",
+        "created_at": datetime.utcnow()
+    })
+    # إنشاء عامل افتراضي
+    worker_hash = bcrypt.hashpw("123".encode(), bcrypt.gensalt()).decode()
+    users_collection.document("worker").set({
+        "username": "worker",
+        "password": worker_hash,
+        "role": "worker",
+        "created_at": datetime.utcnow()
+    })
+
+settings_doc = db.collection("system").document("global_settings")
+if not settings_doc.get().exists:
+    settings_doc.set({
+        "llm_provider": "google",
+        "llm_model": "gemini-1.5-flash",
+        "openai_api_key": "",
+        "google_api_key": "",
+        "anthropic_api_key": "",
+        "pinecone_api_key": "",
+        "pinecone_index_name": "",
+        "system_prompt": "أنت 'الأسطى سيد'، مهندس وصنايعي محترف في التشغيل المعدني وصيانة الماكينات والضواغط. أجب باختصار وبلهجة مصرية عامية، وقدم خطوات واضحة وعملية بناءً على المعطيات الفنية فقط."
+    })
+
+SYSTEM_CONFIG = settings_doc.get().to_dict()
+
+if "current_user" not in st.session_state: st.session_state.current_user = None
+if "active_chat_id" not in st.session_state: st.session_state.active_chat_id = None
+
+# =====================================================================
+# [القسم الثالث]: محركات الذكاء الاصطناعي والصوتيات (AI, RAG & Audio)
+# =====================================================================
+def perform_semantic_search(query: str, top_k: int = 3) -> str:
+    api_key = decrypt_data(SYSTEM_CONFIG.get("pinecone_api_key", ""))
+    index_name = SYSTEM_CONFIG.get("pinecone_index_name", "")
+    openai_key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
+    google_key = decrypt_data(SYSTEM_CONFIG.get("google_api_key", ""))
+
+    if not api_key or not index_name:
+        return "" # إرجاع نص فارغ إذا لم يتم إعداد Pinecone
+
+    try:
+        pc_client = PineconeClient(api_key=api_key)
+        
+        # اختيار نموذج التضمين (Embeddings) بناءً على المفاتيح المتوفرة
+        embeddings_model = None
+        if openai_key:
+            embeddings_model = OpenAIEmbeddings(openai_api_key=openai_key)
+        elif google_key:
+            embeddings_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_key)
+        else:
+            return ""
+
+        vector_store = PineconeVectorStore(index=pc_client.Index(index_name), embedding=embeddings_model)
+        search_results = vector_store.similarity_search(query, k=top_k)
+        
+        # دمج النصوص المستخرجة
+        context_text = "\n---\n".join([doc.page_content for doc in search_results])
+        return context_text
+    except Exception as e:
+        print(f"RAG Error: {e}")
+        return ""
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    openai_key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
+    if not openai_key:
+        return "⚠️ النظام يحتاج إلى إعداد مفتاح OpenAI لتفعيل ميزة تحليل الصوت."
+    
+    try:
+        client = openai.OpenAI(api_key=openai_key)
+        # إنشاء ملف مؤقت لحفظ الصوت لمعالجته
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
+            
+        with open(temp_path, "rb") as af:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=af,
+                language="ar" # إجبار التعرف على اللغة العربية بلهجاتها
+            )
+        os.unlink(temp_path) # حذف الملف المؤقت
+        return transcript.text
+    except Exception as e:
+        return f"حدث خطأ أثناء تحليل الصوت: {str(e)}"
+
+def generate_voice_reply(text: str):
+    openai_key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
+    if not openai_key: return None
+    
+    try:
+        client = openai.OpenAI(api_key=openai_key)
+        # تحديد حجم النص لتقليل تكلفة وسرعة الرد (أول 500 حرف فقط)
+        truncated_text = text[:500] 
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="onyx", # صوت Onyx يميل للعمق والرجولة (مناسب لأسطى الورشة)
+            input=truncated_text
+        )
+        return response.content # إرجاع الـ bytes للصوت
+    except Exception as e:
+        print(f"TTS Error: {e}")
+        return None
+
+# =====================================================================
+# [القسم الرابع]: واجهات النظام الشاملة (UI Pages & Modules)
+# =====================================================================
+def render_login_page():
+    st.markdown("<div style='height: 15vh;'></div>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.markdown(f"""
+            <div style="display: flex; flex-direction: column; align-items: center; margin-bottom: 30px;">
+                <div style="background-color: rgba(59, 130, 246, 0.1); padding: 15px; border-radius: 20px; border: 1px solid rgba(59, 130, 246, 0.2); margin-bottom: 15px;">
+                    {SVGS['logo']}
+                </div>
+                <h1 style="margin: 0; font-size: 28px; font-weight: 800; color: #ffffff;">نظام الورشة الذكي</h1>
+                <p style="margin: 5px 0 0 0; font-size: 15px; color: #a1a1aa;">بوابة الدخول للمهندسين والفنيين</p>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        with st.container():
+            st.markdown("<div style='background-color: #111115; border: 1px solid #27272a; border-radius: 16px; padding: 30px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);'>", unsafe_allow_html=True)
+            
+            username = st.text_input("معرف المستخدم (Username)", placeholder="أدخل اسم المستخدم...")
+            password = st.text_input("كلمة المرور (Password)", type="password", placeholder="••••••••")
+            
+            st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
+            
+            if st.button("مصادقة وتسجيل الدخول", type="primary", use_container_width=True):
+                if username and password:
+                    with st.spinner("جاري التحقق من الهوية..."):
+                        users_ref = db.collection("users").where("username", "==", username).get()
+                        if users_ref:
+                            user_data = users_ref[0].to_dict()
+                            stored_hash = user_data.get("password", "")
+                            if bcrypt.checkpw(password.encode(), stored_hash.encode()):
+                                st.session_state.current_user = {"id": users_ref[0].id, **user_data}
+                                st.rerun()
+                            else:
+                                st.error("كلمة المرور غير صحيحة.")
+                        else:
+                            st.error("المستخدم غير موجود بالنظام.")
+                else:
+                    st.warning("يرجى تعبئة كافة الحقول.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+def render_chat_kiosk():
+    # الهيدر المخصص للشات
+    st.markdown(f"""
+        <div style="display: flex; justify-content: space-between; align-items: center; background-color: #111115; border: 1px solid #27272a; padding: 15px 20px; border-radius: 16px; margin-bottom: 20px;">
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <div style="background-color: rgba(59, 130, 246, 0.1); padding: 10px; border-radius: 12px; border: 1px solid rgba(59, 130, 246, 0.2);">
+                    {SVGS['chat']}
+                </div>
+                <div>
+                    <h2 style="margin: 0; font-size: 20px; font-weight: 800;">الأسطى المساعد (AI Agent)</h2>
+                    <p style="margin: 0; font-size: 13px; color: #10b981; font-weight: 600;">● متصل بقاعدة المعرفة (RAG Online)</p>
+                </div>
+            </div>
+            <div style="color: #a1a1aa; font-size: 14px;">
+                <span style="background-color: #18181b; padding: 6px 12px; border-radius: 8px; border: 1px solid #27272a;">{SYSTEM_CONFIG.get('llm_model')}</span>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    user_id = st.session_state.current_user["id"]
+
+    # إدارة المحادثات السابقة (Sidebar Logic)
+    with st.sidebar:
+        st.markdown("<h3 style='margin-bottom: 15px;'>سجل الأعطال والمحادثات</h3>", unsafe_allow_html=True)
+        
+        if st.button("📝 فتح تذكرة جديدة", type="primary", use_container_width=True):
+            new_session = db.collection("chat_sessions").add({
+                "user_id": user_id,
+                "title": "استفسار فني جديد",
+                "updated_at": datetime.utcnow()
+            })
+            st.session_state.active_chat_id = new_session[1].id
+            st.rerun()
+            
+        st.markdown("<hr style='border-color: #27272a;'>", unsafe_allow_html=True)
+        
+        # جلب الجلسات السابقة للمستخدم
+        sessions = db.collection("chat_sessions").where("user_id", "==", user_id).order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
+        for s in sessions:
+            s_dict = s.to_dict()
+            session_title = s_dict.get("title", "محادثة")
+            
+            cols = st.columns([5, 1])
+            # زر اختيار المحادثة
+            if cols[0].button(session_title, key=f"sel_{s.id}", use_container_width=True):
+                st.session_state.active_chat_id = s.id
+                st.rerun()
+            # زر حذف المحادثة
+            if cols[1].button("🗑️", key=f"del_{s.id}", help="حذف المحادثة"):
+                db.collection("chat_sessions").document(s.id).delete()
+                # مسح رسائل الجلسة
+                msg_docs = db.collection("chat_history").where("session_id", "==", s.id).stream()
+                for m in msg_docs: m.reference.delete()
+                
+                if st.session_state.active_chat_id == s.id:
+                    st.session_state.active_chat_id = None
+                st.rerun()
+
+    # إذا لم تكن هناك محادثة نشطة
+    if not st.session_state.active_chat_id:
+        st.info("الرجاء تحديد محادثة من القائمة أو بدء تذكرة استفسار جديدة.")
         return
 
-    tenant = sidebar(db)
-    if st.session_state.user["role"] == "admin":
-        tab_chat, tab_docs, tab_alerts, tab_settings = st.tabs(["الشات", "الكتالوجات", "التنبيهات", "الإعدادات"])
-        with tab_chat:
-            chat_page(db, tenant)
-        with tab_docs:
-            documents_page(db, tenant)
-        with tab_alerts:
-            alerts_page(db, tenant)
-        with tab_settings:
-            settings_page(db, tenant)
-    else:
-        chat_page(db, tenant)
+    # عرض الرسائل في مساحة مخصصة قابلة للتمرير (Scrollable Container)
+    chat_box = st.container(height=500, border=False)
+    with chat_box:
+        history_query = db.collection("chat_history").where("session_id", "==", st.session_state.active_chat_id).order_by("timestamp")
+        messages = [doc.to_dict() for doc in history_query.stream()]
+        
+        if not messages:
+            st.markdown("""
+                <div style='text-align: center; color: #a1a1aa; padding-top: 100px;'>
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.5; margin-bottom: 10px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                    <p>المساعد جاهز لاستقبال استفساراتك الفنية.<br>يمكنك الكتابة، تسجيل الصوت، أو رفع صورة للمشكلة.</p>
+                </div>
+            """, unsafe_allow_html=True)
+            
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("image_base64"):
+                    # عرض الصورة المرفقة
+                    image_bytes = base64.b64decode(msg["image_base64"])
+                    st.image(image_bytes, width=250)
+                if msg.get("audio_bytes"):
+                    # عرض مشغل الصوت للرد
+                    st.audio(msg["audio_bytes"])
 
+    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
 
+    # شريط الإدخال المتقدم (Input Area)
+    input_row = st.columns([1, 10])
+    
+    with input_row[0]:
+        # القائمة المنبثقة للمرفقات (WhatsApp Style)
+        with st.popover(SVGS["attach"], help="المرفقات"):
+            st.markdown("<p style='font-weight: 700; color: #fafafa; border-bottom: 1px solid #27272a; padding-bottom: 10px; margin-bottom: 15px;'>إرفاق وسائط متعددة</p>", unsafe_allow_html=True)
+            
+            st.markdown(f"<div style='display:flex; align-items:center; gap:8px;'>{SVGS['mic']} <span style='font-weight:600;'>تسجيل صوتي للأسطى</span></div>", unsafe_allow_html=True)
+            audio_upload = st.audio_input("", key="mic_input")
+            
+            st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+            
+            st.markdown(f"<div style='display:flex; align-items:center; gap:8px;'>{SVGS['image']} <span style='font-weight:600;'>إرفاق صورة للعطل</span></div>", unsafe_allow_html=True)
+            image_upload = st.file_uploader("", type=["jpg", "png", "jpeg"], key="img_input")
+
+    with input_row[1]:
+        text_input = st.chat_input("اشرح المشكلة أو العطل هنا...")
+
+    # معالجة حدث الإرسال (Trigger)
+    if text_input or audio_upload or image_upload:
+        final_user_text = text_input or ""
+        img_b64 = None
+        
+        # 1. معالجة الصورة
+        if image_upload:
+            img_bytes = image_upload.read()
+            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            if not final_user_text:
+                final_user_text = "الرجاء تحليل المشكلة في هذه الصورة وإعطائي الحل."
+                
+        # 2. معالجة الصوت
+        if audio_upload:
+            with st.spinner("جاري تفريغ الصوت وتحويله لنص..."):
+                transcribed_text = transcribe_audio(audio_upload.read())
+                final_user_text = f"{final_user_text}\n{transcribed_text}".strip()
+
+        # إظهار رسالة المستخدم فوراً
+        with st.chat_message("user"):
+            st.markdown(final_user_text)
+            if img_b64:
+                st.image(image_upload, width=200)
+
+        # حفظ رسالة المستخدم في القاعدة
+        db.collection("chat_history").add({
+            "session_id": st.session_state.active_chat_id,
+            "role": "user",
+            "content": final_user_text,
+            "image_base64": img_b64,
+            "timestamp": datetime.utcnow()
+        })
+        
+        # تحديث عنوان الجلسة إذا كانت جديدة
+        session_ref = db.collection("chat_sessions").document(st.session_state.active_chat_id)
+        current_title = session_ref.get().to_dict().get("title", "")
+        if current_title == "استفسار فني جديد" and final_user_text:
+            new_title = final_user_text[:40] + "..."
+            session_ref.update({"title": new_title, "updated_at": datetime.utcnow()})
+        else:
+            session_ref.update({"updated_at": datetime.utcnow()})
+
+        # 3. معالجة رد الذكاء الاصطناعي (LLM & RAG)
+        with st.chat_message("assistant"):
+            with st.spinner("الأسطى يبحث في الكتالوجات ويفكر في الحل..."):
+                try:
+                    # جلب السياق من Pinecone
+                    rag_context = perform_semantic_search(final_user_text, top_k=3)
+                    
+                    # بناء رسالة النظام (System Prompt)
+                    base_prompt = SYSTEM_CONFIG.get("system_prompt", "")
+                    full_system_prompt = f"{base_prompt}\n\n=== معلومات مرجعية من الكتالوجات (RAG) ===\n{rag_context}\n==================================\nأجب بناءً على خبرتك وهذه المراجع إن لزم الأمر."
+                    
+                    # بناء الرسائل للموديل
+                    messages = [SystemMessage(content=full_system_prompt)]
+                    
+                    content_block = [{"type": "text", "text": final_user_text}]
+                    if img_b64:
+                        content_block.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+                    
+                    messages.append(HumanMessage(content=content_block))
+
+                    # تهيئة محرك الـ LLM المختار
+                    provider = SYSTEM_CONFIG.get("llm_provider", "google")
+                    model_name = SYSTEM_CONFIG.get("llm_model", "gemini-1.5-flash")
+                    llm = None
+                    
+                    if provider == "google":
+                        key = decrypt_data(SYSTEM_CONFIG.get("google_api_key", ""))
+                        if not key: raise ValueError("مفتاح Google API مفقود في الإعدادات.")
+                        llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=key, temperature=0.3)
+                    elif provider == "openai":
+                        key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
+                        if not key: raise ValueError("مفتاح OpenAI API مفقود في الإعدادات.")
+                        llm = ChatOpenAI(model=model_name, openai_api_key=key, temperature=0.3)
+                    elif provider == "anthropic":
+                        key = decrypt_data(SYSTEM_CONFIG.get("anthropic_api_key", ""))
+                        if not key: raise ValueError("مفتاح Anthropic API مفقود في الإعدادات.")
+                        llm = ChatAnthropic(model_name=model_name, api_key=key, temperature=0.3)
+                    else:
+                        raise ValueError("مزود خدمة غير معروف.")
+
+                    # استقبال الرد بالبث المباشر (Streaming)
+                    stream_response = llm.stream(messages)
+                    final_ai_text = st.write_stream(stream_response)
+                    
+                    # توليد الصوت للرد (TTS)
+                    audio_reply_bytes = generate_voice_reply(final_ai_text)
+                    if audio_reply_bytes:
+                        st.audio(audio_reply_bytes, format="audio/mp3")
+                        
+                    # حفظ رد المساعد في القاعدة
+                    db.collection("chat_history").add({
+                        "session_id": st.session_state.active_chat_id,
+                        "role": "assistant",
+                        "content": final_ai_text,
+                        "audio_bytes": audio_reply_bytes,
+                        "timestamp": datetime.utcnow()
+                    })
+
+                except Exception as e:
+                    error_msg = f"تعذر إكمال العملية بسبب خطأ تقني: {str(e)}"
+                    st.error(error_msg)
+                    db.collection("chat_history").add({
+                        "session_id": st.session_state.active_chat_id,
+                        "role": "assistant",
+                        "content": error_msg,
+                        "timestamp": datetime.utcnow()
+                    })
+
+def render_dashboard():
+    st.markdown(f"""
+        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 30px;">
+            <div style="background-color: rgba(16, 185, 129, 0.1); padding: 12px; border-radius: 12px; border: 1px solid rgba(16, 185, 129, 0.2);">
+                {SVGS['dashboard']}
+            </div>
+            <div>
+                <h1 style="margin: 0; font-size: 24px;">لوحة المؤشرات والتحكم (Dashboard)</h1>
+                <p style="margin: 0; color: #a1a1aa; font-size: 14px;">نظرة عامة على أداء النظام واستخدام الورشة</p>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    # حساب الإحصائيات من Firebase
+    total_users = len(list(db.collection("users").stream()))
+    total_sessions = len(list(db.collection("chat_sessions").stream()))
+    total_docs = len(list(db.collection("knowledge_docs").stream()))
+    total_messages = len(list(db.collection("chat_history").stream()))
+    
+    # عرض الـ Metrics بتصميم مميز
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown("<div data-testid='metric-container'>", unsafe_allow_html=True)
+        st.metric("إجمالي العمال", f"{total_users}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m2:
+        st.markdown("<div data-testid='metric-container'>", unsafe_allow_html=True)
+        st.metric("تذاكر الأعطال", f"{total_sessions}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m3:
+        st.markdown("<div data-testid='metric-container'>", unsafe_allow_html=True)
+        st.metric("الكتالوجات المرفوعة", f"{total_docs}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m4:
+        st.markdown("<div data-testid='metric-container'>", unsafe_allow_html=True)
+        st.metric("عمليات الذكاء الاصطناعي", f"{total_messages}")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+    st.markdown("<hr style='border-color: #27272a; margin: 40px 0;'>", unsafe_allow_html=True)
+    
+    # رسم بياني توضيحي (استخدام رسوم ستريمليت المدمجة)
+    st.subheader("نشاط النظام")
+    chart_data = {"الاستعلامات": [10, 25, 15, 30, 45, 20, 60], "حلول الأعطال": [8, 20, 12, 28, 40, 18, 55]}
+    st.line_chart(chart_data, color=["#3b82f6", "#10b981"])
+
+def render_user_management():
+    st.markdown(f"""
+        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 30px;">
+            <div style="background-color: rgba(245, 158, 11, 0.1); padding: 12px; border-radius: 12px; border: 1px solid rgba(245, 158, 11, 0.2);">
+                {SVGS['users']}
+            </div>
+            <div>
+                <h1 style="margin: 0; font-size: 24px;">إدارة الأفراد والصلاحيات</h1>
+                <p style="margin: 0; color: #a1a1aa; font-size: 14px;">إضافة وحذف حسابات العمال والمهندسين</p>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("إضافة فرد جديد للمنظومة", expanded=True):
+        with st.form("add_user_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            new_username = c1.text_input("معرف الموظف (Username)")
+            new_password = c2.text_input("كلمة المرور", type="password")
+            new_role = c3.selectbox("مستوى الصلاحية", ["worker", "admin"], format_func=lambda x: "مهندس إداري" if x=="admin" else "صنايعي / عامل")
+            
+            submit_btn = st.form_submit_button("تسجيل الحساب", type="primary")
+            if submit_btn:
+                if new_username and new_password:
+                    # التحقق من عدم وجود الاسم مسبقاً
+                    existing = list(db.collection("users").where("username", "==", new_username).stream())
+                    if existing:
+                        st.error("هذا المعرف مستخدم بالفعل.")
+                    else:
+                        hashed_pw = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+                        db.collection("users").add({
+                            "username": new_username,
+                            "password": hashed_pw,
+                            "role": new_role,
+                            "created_at": datetime.utcnow()
+                        })
+                        st.success("تم تسجيل الفرد بنجاح.")
+                        time.sleep(1)
+                        st.rerun()
+                else:
+                    st.warning("يجب تعبئة المعرف وكلمة المرور.")
+
+    st.markdown("<h3 style='margin-top: 30px;'>قائمة الأفراد المسجلين</h3>", unsafe_allow_html=True)
+    users_list = list(db.collection("users").order_by("created_at").stream())
+    
+    for u in users_list:
+        u_data = u.to_dict()
+        with st.container():
+            st.markdown("<div style='background-color: #111115; border: 1px solid #27272a; border-radius: 8px; padding: 15px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;'>", unsafe_allow_html=True)
+            colA, colB, colC = st.columns([3, 2, 1])
+            
+            with colA:
+                icon = SVGS['lock'] if u_data['role'] == 'admin' else SVGS['user_profile']
+                st.markdown(f"<div style='display:flex; align-items:center; gap:10px;'><div style='width:24px;'>{icon}</div> <span style='font-weight:700; font-size:16px;'>{u_data['username']}</span></div>", unsafe_allow_html=True)
+            with colB:
+                role_label = "إدارة عليا" if u_data['role'] == 'admin' else "قسم التشغيل"
+                color = "#3b82f6" if u_data['role'] == 'admin' else "#a1a1aa"
+                st.markdown(f"<span style='color:{color}; font-weight:600;'>{role_label}</span>", unsafe_allow_html=True)
+            with colC:
+                if u_data['username'] != "admin": # حماية حساب الأدمن الرئيسي
+                    if st.button("حذف الحساب", key=f"del_user_{u.id}", help="إزالة الفرد نهائياً"):
+                        db.collection("users").document(u.id).delete()
+                        st.toast("تم إزالة الحساب بنجاح.")
+                        st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+def render_knowledge_base():
+    st.markdown(f"""
+        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 30px;">
+            <div style="background-color: rgba(139, 92, 246, 0.1); padding: 12px; border-radius: 12px; border: 1px solid rgba(139, 92, 246, 0.2);">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"></path></svg>
+            </div>
+            <div>
+                <h1 style="margin: 0; font-size: 24px;">الكتالوجات والذاكرة الفنية (RAG)</h1>
+                <p style="margin: 0; color: #a1a1aa; font-size: 14px;">رفع وتدريب المساعد على كتالوجات الـ CNC والضواغط</p>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # قسم رفع الملفات ومعالجتها
+    st.markdown("<div style='background-color: #111115; border: 1px dashed #3f3f46; border-radius: 16px; padding: 30px; text-align: center;'>", unsafe_allow_html=True)
+    st.markdown(f"<div style='display:flex; justify-content:center; margin-bottom:15px;'>{SVGS['pdf']}</div>", unsafe_allow_html=True)
+    
+    uploaded_files = st.file_uploader("قم بسحب وإفلات ملفات الـ PDF أو النصوص هنا", accept_multiple_files=True, type=['pdf', 'txt'])
+    
+    if st.button("بدء المعالجة والحقن في قاعدة البيانات السحابية (Pinecone)", type="primary"):
+        if not uploaded_files:
+            st.warning("يرجى اختيار ملفات أولاً لإتمام العملية.")
+            return
+
+        api_key = decrypt_data(SYSTEM_CONFIG.get("pinecone_api_key", ""))
+        index_name = SYSTEM_CONFIG.get("pinecone_index_name", "")
+        openai_key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
+        google_key = decrypt_data(SYSTEM_CONFIG.get("google_api_key", ""))
+
+        if not api_key or not index_name:
+            st.error("مفاتيح Pinecone غير معدة! يرجى تكوينها من نافذة الإعدادات أولاً.")
+            return
+
+        # تحديد محرك التضمين
+        embeddings = None
+        if openai_key:
+            embeddings = OpenAIEmbeddings(openai_api_key=openai_key)
+        elif google_key:
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_key)
+        
+        if not embeddings:
+            st.error("مفاتيح الـ Embeddings (OpenAI أو Google) غير متوفرة.")
+            return
+
+        pc = PineconeClient(api_key=api_key)
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_files = len(uploaded_files)
+        
+        for i, file in enumerate(uploaded_files):
+            status_text.text(f"جاري قراءة ومعالجة: {file.name} ...")
+            
+            text_content = ""
+            try:
+                if file.name.endswith('.pdf'):
+                    pdf_reader = PdfReader(file)
+                    for page in pdf_reader.pages:
+                        extracted = page.extract_text()
+                        if extracted: text_content += extracted + "\n"
+                else:
+                    text_content = file.read().decode('utf-8')
+
+                if not text_content.strip():
+                    st.warning(f"الملف {file.name} فارغ أو لا يمكن قراءة نصوصه.")
+                    continue
+
+                status_text.text(f"تقطيع النص (Chunking) للملف: {file.name} ...")
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
+                chunks = text_splitter.split_text(text_content)
+                
+                # إضافة Metadata
+                metadatas = [{"source": file.name, "chunk_id": idx} for idx in range(len(chunks))]
+                
+                status_text.text(f"توليد المتجهات (Embeddings) والرفع لـ Pinecone للملف: {file.name} ...")
+                vector_store = PineconeVectorStore(index=pc.Index(index_name), embedding=embeddings)
+                vector_store.add_texts(texts=chunks, metadatas=metadatas)
+                
+                # توثيق العملية في Firebase
+                db.collection("knowledge_docs").add({
+                    "filename": file.name,
+                    "chunks_count": len(chunks),
+                    "uploaded_at": datetime.utcnow()
+                })
+                
+                progress_bar.progress((i + 1) / total_files)
+                
+            except Exception as e:
+                st.error(f"فشل في معالجة {file.name}: {str(e)}")
+                
+        status_text.text("تم اكتمال عملية الفهرسة بنجاح!")
+        st.success("أصبحت الكتالوجات الآن في ذاكرة المساعد الذكي.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # عرض الملفات المؤرشفة
+    st.markdown("<h3 style='margin-top: 40px;'>أرشيف الكتالوجات المحفوظة</h3>", unsafe_allow_html=True)
+    docs_ref = db.collection("knowledge_docs").order_by("uploaded_at", direction=firestore.Query.DESCENDING).stream()
+    
+    for doc in docs_ref:
+        d_info = doc.to_dict()
+        with st.container():
+            st.markdown("<div style='background-color: #18181b; border: 1px solid #27272a; border-radius: 8px; padding: 12px 20px; margin-bottom: 10px;'>", unsafe_allow_html=True)
+            colA, colB, colC = st.columns([4, 2, 1])
+            colA.markdown(f"<span style='font-weight:700; color:#fafafa;'>{d_info.get('filename')}</span>", unsafe_allow_html=True)
+            colB.markdown(f"<span style='color:#a1a1aa; font-size:14px;'>عدد الأجزاء: {d_info.get('chunks_count', 0)}</span>", unsafe_allow_html=True)
+            if colC.button("إزالة السجل", key=f"del_doc_{doc.id}"):
+                db.collection("knowledge_docs").document(doc.id).delete()
+                st.toast("تم حذف السجل من لوحة التحكم (تحتاج لحذف الـ Vectors من منصة Pinecone يدوياً).")
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+def render_settings():
+    st.markdown(f"""
+        <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 30px;">
+            <div style="background-color: rgba(236, 72, 153, 0.1); padding: 12px; border-radius: 12px; border: 1px solid rgba(236, 72, 153, 0.2);">
+                {SVGS['settings']}
+            </div>
+            <div>
+                <h1 style="margin: 0; font-size: 24px;">تكوين النظام الأساسي (Global Config)</h1>
+                <p style="margin: 0; color: #a1a1aa; font-size: 14px;">إدارة مفاتيح الـ API، الموديلات، وهندسة الأوامر</p>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    tab1, tab2, tab3 = st.tabs(["🤖 إعدادات الذكاء الاصطناعي", "🌲 إعدادات Pinecone (RAG)", "🧠 شخصية המساعد (Prompt)"])
+
+    with st.form("master_settings_form"):
+        with tab1:
+            st.markdown("### مزودي الخدمة (LLM Providers)")
+            col1, col2 = st.columns(2)
+            
+            provider_options = ["google", "openai", "anthropic"]
+            current_provider = SYSTEM_CONFIG.get("llm_provider", "google")
+            selected_provider = col1.selectbox("المحرك الأساسي للردود", provider_options, index=provider_options.index(current_provider) if current_provider in provider_options else 0)
+            
+            model_name = col2.text_input("اسم الموديل المخصص", value=SYSTEM_CONFIG.get("llm_model", "gemini-1.5-flash"))
+            
+            st.markdown("### مفاتيح التشفير السحابية (API Keys)")
+            st.info("يتم تشفير هذه المفاتيح وتخزينها بأمان تام في قاعدة البيانات باستخدام خوارزمية Fernet.")
+            
+            google_key = st.text_input("Google Gemini API Key", value=decrypt_data(SYSTEM_CONFIG.get("google_api_key", "")), type="password")
+            openai_key = st.text_input("OpenAI API Key (إلزامي لميزة الصوت Whisper/TTS)", value=decrypt_data(SYSTEM_CONFIG.get("openai_api_key", "")), type="password")
+            anthropic_key = st.text_input("Anthropic Claude API Key", value=decrypt_data(SYSTEM_CONFIG.get("anthropic_api_key", "")), type="password")
+
+        with tab2:
+            st.markdown("### قاعدة البيانات الاتجاهية للذاكرة (Vector DB)")
+            pinecone_key = st.text_input("Pinecone API Key", value=decrypt_data(SYSTEM_CONFIG.get("pinecone_api_key", "")), type="password")
+            pinecone_idx = st.text_input("Pinecone Index Name (اسم الفهرس)", value=SYSTEM_CONFIG.get("pinecone_index_name", ""))
+
+        with tab3:
+            st.markdown("### هندسة شخصية المساعد (System Prompt Engineering)")
+            st.caption("التعليمات المكتوبة هنا هي التي ستوجه أسلوب الرد، اللهجة، وطريقة التفكير للمساعد.")
+            system_prompt = st.text_area("التعليمات الشاملة (System Prompt)", value=SYSTEM_CONFIG.get("system_prompt", ""), height=250)
+
+        st.markdown("<hr style='border-color: #27272a;'>", unsafe_allow_html=True)
+        
+        if st.form_submit_button("حفظ الإعدادات الشاملة بالسحابة", type="primary"):
+            with st.spinner("جاري تشفير البيانات وحفظها..."):
+                settings_doc.update({
+                    "llm_provider": selected_provider,
+                    "llm_model": model_name,
+                    "google_api_key": encrypt_data(google_key),
+                    "openai_api_key": encrypt_data(openai_key),
+                    "anthropic_api_key": encrypt_data(anthropic_key),
+                    "pinecone_api_key": encrypt_data(pinecone_key),
+                    "pinecone_index_name": pinecone_idx,
+                    "system_prompt": system_prompt
+                })
+            st.success("تم تحديث إعدادات النظام بنجاح وتطبيقها على كافة المستخدمين.")
+            time.sleep(1)
+            st.rerun()
+
+# =====================================================================
+# [القسم الخامس]: موجه الصفحات والهيكل الأساسي (Main Router & Layout)
+# =====================================================================
+def main_app_router():
+    # التحقق من الجلسة
+    if not st.session_state.current_user:
+        render_login_page()
+        return
+
+    user_info = st.session_state.current_user
+    is_admin = user_info.get("role") == "admin"
+
+    # بناء القائمة الجانبية المتقدمة (Sidebar Navbar)
+    with st.sidebar:
+        # User Profile Header
+        st.markdown(f"""
+            <div style="background-color: #18181b; padding: 20px; border-radius: 16px; border: 1px solid #27272a; margin-bottom: 25px; text-align: center;">
+                <div style="margin-bottom: 10px; display: flex; justify-content: center;">
+                    {SVGS['user_profile']}
+                </div>
+                <h3 style="margin: 0; color: #ffffff; font-size: 18px;">{user_info.get('username')}</h3>
+                <span style="background-color: {'rgba(59, 130, 246, 0.2)' if is_admin else 'rgba(161, 161, 170, 0.1)'}; color: {'#3b82f6' if is_admin else '#a1a1aa'}; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-top: 8px; display: inline-block;">
+                    {'مدير النظام' if is_admin else 'صنايعي تشغيل'}
+                </span>
+            </div>
+            <p style="color: #52525b; font-size: 12px; font-weight: 800; margin-bottom: 5px; padding-right: 10px;">روابط المنظومة</p>
+        """, unsafe_allow_html=True)
+
+        # تحديد خيارات القائمة بناءً على الصلاحيات
+        nav_options = ["المساعد الفني (Chat)"]
+        if is_admin:
+            nav_options.extend(["لوحة المؤشرات", "المستخدمين والصلاحيات", "إدارة الكتالوجات (RAG)", "تكوين النظام (Settings)"])
+
+        selected_page = st.radio("Navigation", nav_options, label_visibility="collapsed")
+        
+        st.markdown("<div style='flex-grow: 1; height: 50px;'></div>", unsafe_allow_html=True)
+        st.markdown("<hr style='border-color: #27272a;'>", unsafe_allow_html=True)
+        
+        # زر تسجيل الخروج المخصص
+        if st.button("إنهاء الجلسة الآمنة", use_container_width=True):
+            st.session_state.current_user = None
+            st.session_state.active_chat_id = None
+            st.rerun()
+
+    # محرك عرض الصفحات (Page Renderer)
+    if selected_page == "المساعد الفني (Chat)":
+        render_chat_kiosk()
+    elif selected_page == "لوحة المؤشرات":
+        render_dashboard()
+    elif selected_page == "المستخدمين والصلاحيات":
+        render_user_management()
+    elif selected_page == "إدارة الكتالوجات (RAG)":
+        render_knowledge_base()
+    elif selected_page == "تكوين النظام (Settings)":
+        render_settings()
+
+# نقطة إقلاع التطبيق
 if __name__ == "__main__":
-    main()
-
+    main_app_router()
