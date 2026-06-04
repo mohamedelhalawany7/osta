@@ -191,17 +191,22 @@ def analyze_machine_issues_job():
             openai_key = decrypt_val(tenant['openai_api_key'])
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             
-            # جلب المحادثات لآخر شهر
-            history_query = db.collection('conversation_history')\
-                .where('tenant_id', '==', tenant_id)\
-                .where('created_at', '>=', thirty_days_ago)\
-                .order_by('created_at', direction=firestore.Query.DESCENDING)\
-                .limit(500).stream()
+            # جلب المحادثات الخاصة بالـ Tenant وتصفيتها بواسطة بايثون لتفادي خطأ الفهرس المركب (Composite Index)
+            history_query = db.collection('conversation_history').where('tenant_id', '==', tenant_id).stream()
+            history_docs = []
+            for h in history_query:
+                data = h.to_dict()
+                created_at = data.get('created_at')
+                if created_at and created_at >= thirty_days_ago:
+                    history_docs.append(data)
+            
+            # ترتيب النتائج زمنياً
+            history_docs.sort(key=lambda x: x.get('created_at', datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+            history_docs = history_docs[:500]
                 
-            history_docs = list(history_query)
             if len(history_docs) < 10: continue
             
-            text_log = "\n".join([f"{h.to_dict()['role']}: {h.to_dict()['content']}" for h in history_docs])
+            text_log = "\n".join([f"{h.get('role', '')}: {h.get('content', '')}" for h in history_docs])
             prompt = """بصفتك مهندس صيانة ذكي، قم بتحليل سجلات محادثات العمال التالية خلال الشهر الماضي. 
 هل تلاحظ وجود عطل في ماكينة معينة يتكرر السؤال عنه؟ إذا وجدت تكراراً يعطي مؤشراً على مشكلة مزمنة، اكتب تنبيهاً واحداً يوضح الماكينة. إذا كانت الأمور طبيعية اكتب فقط 'لا يوجد'."""
             
@@ -331,9 +336,11 @@ def chat_view():
             st.rerun()
             
         st.divider()
-        sessions = list(db.collection('chat_sessions')\
-            .where('user_id', '==', user_id)\
-            .order_by('updated_at', direction=firestore.Query.DESCENDING).stream())
+        
+        # استبدال الترتيب في الاستعلام بالترتيب في بايثون لمنع مشاكل الـ Composite Indexes
+        sessions_query = db.collection('chat_sessions').where('user_id', '==', user_id).stream()
+        sessions = list(sessions_query)
+        sessions.sort(key=lambda x: x.to_dict().get('updated_at', datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
         
         if not st.session_state.chat_session_uuid and sessions:
             st.session_state.chat_session_uuid = sessions[0].id
@@ -370,10 +377,10 @@ def chat_view():
     
     st.markdown("<h2 class='text-primary-custom'><i class='bi bi-robot'></i> الأسطى بلية</h2>", unsafe_allow_html=True)
     
-    # جلب الرسائل من Firestore
-    chat_history = list(db.collection('conversation_history')\
-        .where('session_id', '==', current_session)\
-        .order_by('created_at').stream())
+    # جلب الرسائل من Firestore وترتيبها في بايثون
+    chat_history_query = db.collection('conversation_history').where('session_id', '==', current_session).stream()
+    chat_history = list(chat_history_query)
+    chat_history.sort(key=lambda x: x.to_dict().get('created_at', datetime.min.replace(tzinfo=timezone.utc)))
     
     for msg_doc in chat_history:
         msg = msg_doc.to_dict()
@@ -479,7 +486,9 @@ def chat_view():
                     if not llm:
                         st.error("لم يتم التعرف على مزود الخدمة أو المفاتيح ناقصة.")
                     else:
-                        hist_text = "\n".join([f"{h.to_dict()['role']}: {h.to_dict()['content']}" for h in chat_history[-3:]])
+                        # الترتيب باستخدام بايثون لمنع الـ index errors
+                        recent_history = chat_history[-3:]
+                        hist_text = "\n".join([f"{h.to_dict()['role']}: {h.to_dict()['content']}" for h in recent_history])
                         sys_prompt = f"{tenant.get('workshop_prompt')}\n\nتاريخ المحادثة:\n{hist_text}\n\nمعلومات من الكتالوجات:\n{rag_context}"
                         
                         human_msg_content = [{"type": "text", "text": transcribed_text}]
@@ -510,7 +519,10 @@ def admin_dashboard():
     tenant_id = st.session_state.tenant_id
     
     chats_count = len(list(db.collection('conversation_history').where('tenant_id', '==', tenant_id).stream()))
-    workers_count = len(list(db.collection('users').where('tenant_id', '==', tenant_id).where('role', '==', 'worker').stream()))
+    
+    # تجنب استخدام where متعددة لتفادي الحاجة للـ Composite Index
+    all_users = list(db.collection('users').where('tenant_id', '==', tenant_id).stream())
+    workers_count = sum(1 for u in all_users if u.to_dict().get('role') == 'worker')
     
     col1, col2, col3 = st.columns(3)
     col1.markdown(f"<div class='custom-card'><h3 class='text-primary-custom'>{chats_count}</h3><p>الرسائل والاستفسارات</p></div>", unsafe_allow_html=True)
@@ -518,7 +530,12 @@ def admin_dashboard():
     col3.markdown(f"<div class='custom-card'><h3 class='text-success-custom'>--</h3><p>الوضع</p></div>", unsafe_allow_html=True)
 
     st.subheader("⚠️ التنبيهات الذكية (الأعطال المتكررة)")
-    alerts = list(db.collection('alerts').where('tenant_id', '==', tenant_id).order_by('created_at', direction=firestore.Query.DESCENDING).limit(5).stream())
+    
+    # فلتر الاستعلام وترتيب النتائج بواسطة بايثون
+    alerts_query = db.collection('alerts').where('tenant_id', '==', tenant_id).stream()
+    alerts = list(alerts_query)
+    alerts.sort(key=lambda x: x.to_dict().get('created_at', datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    alerts = alerts[:5]
     
     if alerts:
         for a in alerts:
@@ -571,7 +588,8 @@ def admin_rag():
     if uploaded_files:
         if st.button("معالجة وحفظ في الذاكرة"):
             for f in uploaded_files:
-                existing = list(db.collection('uploaded_documents').where('filename', '==', f.name).where('tenant_id', '==', tenant_id).stream())
+                docs_query = db.collection('uploaded_documents').where('tenant_id', '==', tenant_id).stream()
+                existing = [d for d in docs_query if d.to_dict().get('filename') == f.name]
                 if not existing:
                     with st.spinner(f"جاري معالجة {f.name}..."):
                         success, msg = process_document(f.getvalue(), f.name, tenant_dict, tenant_id)
