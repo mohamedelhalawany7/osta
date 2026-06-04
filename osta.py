@@ -441,7 +441,6 @@ async def analyze_machine_issues_cron():
 async def lifespan(app: FastAPI):
     global pc_client_instance
     async with engine.begin() as conn:
-        # تم إزالة شرط "لو مش في الإنتاج" عشان التطبيق يبني جداوله تلقائياً على السحابة
         await conn.run_sync(Base.metadata.create_all)
         try:
             await conn.execute(text("ALTER TABLE tenants ADD COLUMN api_base_url VARCHAR DEFAULT ''"))
@@ -470,19 +469,19 @@ async def lifespan(app: FastAPI):
                 pc_client_instance = PineconeClient(api_key=pk)
                 logger.info("Pinecone Client Initialized (Singleton).")
 
-    if not scheduler.get_jobs():
-        scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
-        scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
-        scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
+    # ✅ الحل: شيل الجوبز الموجودة قبل الإضافة، وابدأ بس لو مش شغال
+    scheduler.remove_all_jobs()
+    scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
+    scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
+    scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
     
     if not scheduler.running:
         scheduler.start()
         
     yield
     
-    try:
-        if scheduler.running:
-            scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
     
     # تفريغ قاعدة البيانات عند إغلاق التطبيق
     try:
