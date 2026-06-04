@@ -303,7 +303,7 @@ if not os.path.exists(FIREBASE_CREDS_FILE) or not init_firebase_connection():
         st.markdown("<h1 style='text-align: center; color: #fafafa; font-size: 28px;'>تهيئة خوادم النظام (Firebase Setup)</h1>", unsafe_allow_html=True)
         st.markdown("<p style='text-align: center; color: #a1a1aa;'>يرجى لصق كود مصادقة Firebase Service Account (JSON) لربط المنصة بالسحابة.</p>", unsafe_allow_html=True)
         
-        firebase_json_input = st.text_area("أدخل كود JSON هنا", height=300, dir="ltr", placeholder='{"type": "service_account", "project_id": "...", ...}')
+        firebase_json_input = st.text_area("أدخل كود JSON هنا", height=300, placeholder='{"type": "service_account", "project_id": "...", ...}')
         
         if st.button("حفظ وتأسيس قاعدة البيانات", type="primary", use_container_width=True):
             if firebase_json_input.strip() == "":
