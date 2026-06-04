@@ -281,7 +281,17 @@ def init_firebase_connection():
     if not firebase_admin._apps:
         try:
             if "FIREBASE_CREDENTIALS" in st.secrets:
-                cred_dict = json.loads(st.secrets["FIREBASE_CREDENTIALS"])
+                secret_val = st.secrets["FIREBASE_CREDENTIALS"]
+                if isinstance(secret_val, str):
+                    # استخدام strict=False للسماح للأسطر الجديدة بالمرور وتفادي خطأ Invalid control character
+                    cred_dict = json.loads(secret_val, strict=False)
+                else:
+                    cred_dict = dict(secret_val)
+                
+                # معالجة مفتاح التشفير لضمان أن الأسطر الجديدة مقروءة بشكل صحيح لـ Firebase
+                if "private_key" in cred_dict:
+                    cred_dict["private_key"] = cred_dict["private_key"].replace('\\n', '\n')
+                    
                 cred = credentials.Certificate(cred_dict)
                 firebase_admin.initialize_app(cred)
             elif os.path.exists(FIREBASE_CREDS_FILE):
