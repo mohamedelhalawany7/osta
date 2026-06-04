@@ -475,20 +475,14 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
         scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
     
-    # ✅ الحماية ضد تشغيل الـ Scheduler أكثر من مرة
-    try:
-        if not scheduler.running:
-            scheduler.start()
-    except Exception as e:
-        logger.warning(f"Scheduler already running or skipped: {e}")
+    if not scheduler.running:
+        scheduler.start()
         
     yield
     
     try:
         if scheduler.running:
             scheduler.shutdown()
-    except Exception:
-        pass
     
     # تفريغ قاعدة البيانات عند إغلاق التطبيق
     try:
