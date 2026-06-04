@@ -3,41 +3,159 @@ import os
 import tempfile
 import time
 import hashlib
-import sqlite3
 import base64
+import json
 from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
+import firebase_admin
+from firebase_admin import credentials, firestore
 import streamlit.components.v1 as components
 
-# إعدادات الصفحة الأساسية
+# ==========================================
+# 1. إعدادات الصفحة الأساسية
+# ==========================================
 st.set_page_config(
-    page_title="OSTA AI | Enterprise System",
-    page_icon="⚙️",
+    page_title="Osta Chat | Enterprise",
+    page_icon="🔧", # Streamlit requires an emoji for the favicon, but UI will use icons
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ==========================================
-# 1. إعداد قاعدة البيانات (Database Setup)
+# 2. تصميم الواجهة (WhatsApp Dark Theme & FontAwesome)
+# ==========================================
+WHATSAPP_CSS = """
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Tajawal', sans-serif !important;
+        direction: rtl; text-align: right;
+    }
+    
+    /* WhatsApp Dark Background */
+    .stApp {
+        background-color: #0b141a !important;
+        background-image: url("https://user-images.githubusercontent.com/15075759/28719144-86dc0f70-73b1-11e7-911d-60d70fcded21.png");
+        background-blend-mode: overlay;
+        color: #e9edef;
+    }
+
+    #MainMenu, footer, header {visibility: hidden;}
+    
+    /* Sidebar Styling */
+    [data-testid="stSidebar"] {
+        background-color: #111b21 !important;
+        border-left: 1px solid #222d34;
+    }
+    
+    /* Input Fields */
+    .stTextInput input, .stTextArea textarea, .stSelectbox select, .stNumberInput input {
+        background-color: #2a3942 !important;
+        color: #d1d7db !important;
+        border: 1px solid #2a3942 !important;
+        border-radius: 8px !important;
+        padding: 12px;
+    }
+    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #00a884 !important; }
+
+    /* Buttons */
+    .stButton > button {
+        background-color: #00a884 !important;
+        color: #111b21 !important; 
+        border: none !important; 
+        border-radius: 24px !important;
+        font-weight: 700 !important; 
+        transition: all 0.2s !important; 
+        width: 100%;
+        padding: 10px;
+    }
+    .stButton > button:hover { background-color: #00c298 !important; }
+    .btn-logout > button { background-color: #ef4444 !important; color: white !important; }
+    .btn-icon > button { background-color: #202c33 !important; color: #8696a0 !important; border-radius: 50% !important; padding: 15px !important;}
+    .btn-icon > button:hover { background-color: #2a3942 !important; color: #d1d7db !important;}
+    
+    /* Chat Bubbles */
+    [data-testid="stChatMessage"] {
+        background-color: transparent !important;
+        padding: 0 !important;
+        margin-bottom: 15px;
+    }
+    
+    /* User Bubble */
+    [data-testid="stChatMessage"]:nth-child(odd) .stMarkdown {
+        background-color: #005c4b;
+        color: #e9edef;
+        padding: 10px 15px;
+        border-radius: 12px 0 12px 12px;
+        max-width: 80%;
+        float: right;
+        clear: both;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    }
+    
+    /* Assistant Bubble */
+    [data-testid="stChatMessage"]:nth-child(even) .stMarkdown {
+        background-color: #202c33;
+        color: #e9edef;
+        padding: 10px 15px;
+        border-radius: 0 12px 12px 12px;
+        max-width: 80%;
+        float: left;
+        clear: both;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    }
+    
+    /* Hide native avatars for cleaner WhatsApp look */
+    [data-testid="stChatMessage"] .stImage, [data-testid="stChatMessage"] div[data-testid="stIcon"] {
+        display: none !important;
+    }
+
+    /* Metric Cards */
+    .metric-box {
+        text-align: center;
+        padding: 20px;
+        background-color: #202c33;
+        border-radius: 12px;
+        border: 1px solid #2a3942;
+    }
+    .metric-value { font-size: 2rem; font-weight: 800; color: #00a884; }
+    .metric-title { font-size: 1rem; color: #8696a0; }
+    
+    /* Custom Icon Wrapper */
+    .icon-title {
+        display: flex; align-items: center; gap: 10px; color: #e9edef; font-size: 1.5rem; font-weight: bold; margin-bottom: 20px;
+    }
+    .icon-title i { color: #00a884; }
+</style>
+"""
+st.markdown(WHATSAPP_CSS, unsafe_allow_html=True)
+
+## ==========================================
+# 3. إعدادات Firebase وقاعدة البيانات
 # ==========================================
 @st.cache_resource
-def init_db():
-    conn = sqlite3.connect('osta_enterprise.db', check_same_thread=False)
-    c = conn.cursor()
-    # جداول النظام
-    c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS chat_sessions (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, created_at DATETIME)')
-    c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id INTEGER, role TEXT, content TEXT, image_b64 TEXT, timestamp DATETIME)')
-    c.execute('CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, title TEXT, content TEXT, timestamp DATETIME)')
+def init_firebase():
+    if not firebase_admin._apps:
+        if "firebase" in st.secrets:
+            cred = credentials.Certificate(dict(st.secrets["firebase"]))
+            firebase_admin.initialize_app(cred)
+        else:
+            st.warning("يرجى إضافة إعدادات Firebase في Streamlit Secrets.")
+            return None
+    return firestore.client()
+
+db = init_firebase()
+
+def init_default_data():
+    if db is None: return
+    users_ref = db.collection('users')
+    if not list(users_ref.where('username', '==', 'admin').limit(1).stream()):
+        users_ref.add({'username': 'admin', 'password': hashlib.sha256(b'admin2024').hexdigest(), 'role': 'Manager'})
+    if not list(users_ref.where('username', '==', 'worker').limit(1).stream()):
+        users_ref.add({'username': 'worker', 'password': hashlib.sha256(b'worker').hexdigest(), 'role': 'Worker'})
     
-    # المستخدمين الافتراضيين
-    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", 
-              ('admin', hashlib.sha256(b'admin2024').hexdigest(), 'Manager'))
-    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", 
-              ('worker', hashlib.sha256(b'worker').hexdigest(), 'Worker'))
-    
-    # الإعدادات الافتراضية
+    settings_ref = db.collection('settings')
     default_settings = {
         'llm_provider': 'OpenAI',
         'llm_model': 'gpt-4o-mini',
@@ -47,58 +165,26 @@ def init_db():
         'k_results': '4',
         'tts_voice': 'onyx',
         'use_openai_tts': 'True',
-        'system_prompt': "أنت 'أسطى كبير' مصري محترف جداً في صيانة ضواغط الهواء والتصنيع المعدني. كلامك كله بلهجة صنايعية مصرية عامية بسيطة. إجابتك يجب أن تكون في خطوات مرقمة (1، 2، 3). إذا لم تكن المعلومة في النص قل 'يا ابني دي مش عندي في الكتالوج دلوقتي'. اعتمد على [المعلومات المرفقة] فقط.",
+        'system_prompt': "أنت 'أسطى كبير' مصري محترف في صيانة ضواغط الهواء والتصنيع المعدني. كلامك بلهجة صنايعية بسيطة وفي خطوات. استخدم [المعلومات المرفقة] فقط.",
         'index_name': 'osta-enterprise-rag'
     }
     for k, v in default_settings.items():
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-        
-    conn.commit()
-    return conn
+        if not settings_ref.document(k).get().exists:
+            settings_ref.document(k).set({'value': str(v)})
 
-conn = init_db()
+init_default_data()
 
-# دوال مساعدة لقاعدة البيانات
 def get_setting(key, default=""):
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    res = c.fetchone()
-    return res[0] if res else default
+    if db is None: return default
+    doc = db.collection('settings').document(key).get()
+    return doc.to_dict().get('value', default) if doc.exists else default
 
 def set_setting(key, value):
-    c = conn.cursor()
-    c.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
+    if db is None: return
+    db.collection('settings').document(key).set({'value': str(value)})
 
-# ==========================================
-# 2. مهام الخلفية والتحليل التلقائي (Cron Jobs)
-# ==========================================
-def cron_fault_analysis():
-    c = conn.cursor()
-    yesterday = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("SELECT content FROM messages WHERE role='user' AND timestamp >= datetime('now', '-1 day')")
-    msgs = c.fetchall()
-    
-    keywords = ['عطل', 'مشكلة', 'حرارة', 'تسريب', 'صوت', 'دخان', 'باظ', 'وقف']
-    fault_count = sum(1 for m in msgs if any(w in str(m[0]) for w in keywords))
-    
-    if fault_count > 0:
-        c.execute("INSERT INTO alerts (title, content, timestamp) VALUES (?, ?, datetime('now'))",
-                  ("تحليل الأعطال اليومي", f"تم رصد {fault_count} بلاغات من العمال تحتوي على كلمات تشير لأعطال محتملة خلال آخر 24 ساعة. يرجى مراجعة سجلات المحادثة."))
-        conn.commit()
-
-@st.cache_resource
-def start_scheduler():
-    scheduler = BackgroundScheduler()
-    # جدولة المهمة لتعمل كل يوم الساعة 2 صباحاً
-    scheduler.add_job(cron_fault_analysis, 'cron', hour=2)
-    scheduler.start()
-    return scheduler
-
-start_scheduler()
-
-# ==========================================
-# 3. الاعتماديات المتأخرة والـ LLMs
+## ==========================================
+# 4. الاعتماديات المتأخرة والـ LLMs
 # ==========================================
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
@@ -124,120 +210,38 @@ def get_llm():
         return ChatOpenAI(model=get_setting('custom_model', 'local-model'), 
                           openai_api_base=get_setting('custom_base_url'), 
                           openai_api_key=get_setting('custom_api_key', 'dummy'), temperature=temp)
-    else: # Default OpenAI
+    else:
         return ChatOpenAI(model=get_setting('llm_model', 'gpt-4o-mini'), 
                           openai_api_key=get_setting('openai_api_key'), temperature=temp)
 
+## ==========================================
+# 5. دوال الصوت والميديا (TTS & STT)
 # ==========================================
-# 4. التصميم والواجهة (World-Class UI/UX)
-# ==========================================
-WORLD_CLASS_CSS = """
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Tajawal', sans-serif !important;
-        direction: rtl; text-align: right;
-    }
-    
-    .stApp {
-        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
-        color: #f8fafc;
-    }
-
-    #MainMenu, footer, header {visibility: hidden;}
-    
-    [data-testid="stSidebar"] {
-        background-color: rgba(15, 23, 42, 0.7) !important;
-        backdrop-filter: blur(20px);
-        border-left: 1px solid rgba(255, 255, 255, 0.05);
-    }
-    
-    .glass-card {
-        background: rgba(30, 41, 59, 0.4);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 16px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
-    }
-    .glass-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-        border-color: rgba(139, 92, 246, 0.3);
-    }
-    
-    .metric-box {
-        text-align: center;
-        padding: 20px;
-        background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
-        border-radius: 12px;
-        border: 1px solid rgba(139, 92, 246, 0.2);
-    }
-    .metric-value { font-size: 2.5rem; font-weight: 800; color: #00f3ff; }
-    .metric-title { font-size: 1.1rem; color: #94a3b8; }
-
-    .stTextInput input, .stTextArea textarea, .stSelectbox select, .stNumberInput input {
-        background-color: rgba(15, 23, 42, 0.8) !important;
-        color: #e2e8f0 !important;
-        border: 1px solid #334155 !important;
-        border-radius: 10px !important;
-    }
-    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #8b5cf6 !important; }
-
-    .stButton > button {
-        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
-        color: white !important; border: none !important; border-radius: 10px !important;
-        font-weight: 700 !important; transition: all 0.3s !important; width: 100%;
-    }
-    .stButton > button:hover { transform: scale(1.02) !important; box-shadow: 0 8px 25px rgba(139, 92, 246, 0.5) !important; }
-    .btn-logout > button { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important; }
-    
-    .chat-bubble-user {
-        background: rgba(99, 102, 241, 0.15); border-radius: 15px 15px 0 15px;
-        padding: 15px; margin-bottom: 10px; border: 1px solid rgba(99, 102, 241, 0.3);
-    }
-    .chat-bubble-ai {
-        background: rgba(30, 41, 59, 0.6); border-radius: 15px 15px 15px 0;
-        padding: 15px; margin-bottom: 10px; border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-</style>
-"""
-st.markdown(WORLD_CLASS_CSS, unsafe_allow_html=True)
-
-# ==========================================
-# 5. دوال مساعدة للـ Audio و RAG
-# ==========================================
-def fallback_tts(text):
-    # محرك نطق مجاني (Web Speech API) متوافق مع المتصفحات
-    js = f"""
-    <script>
-        const text = `{text.replace('`', '').replace('"', '')}`;
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = "ar-EG";
-        utterance.rate = 0.9;
-        window.speechSynthesis.speak(utterance);
-    </script>
-    """
-    components.html(js, height=0, width=0)
-
-def speak_text(text):
+def generate_audio_player_html(text):
     api_key = get_setting('openai_api_key')
-    if api_key and get_setting('use_openai_tts') == 'True':
-        try:
-            client = OpenAI(api_key=api_key)
-            response = client.audio.speech.create(
-                model="tts-1", voice=get_setting('tts_voice', 'onyx'), input=text
-            )
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_mp3:
-                response.stream_to_file(tmp_mp3.name)
-                st.audio(tmp_mp3.name, format="audio/mp3", autoplay=True)
-        except Exception:
-            fallback_tts(text)
-    else:
-        fallback_tts(text)
+    use_tts = get_setting('use_openai_tts', 'True') == 'True'
+    
+    if not api_key or not use_tts:
+        return "" # No TTS player if disabled or no key
+        
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.audio.speech.create(
+            model="tts-1", voice=get_setting('tts_voice', 'onyx'), input=text
+        )
+        audio_b64 = base64.b64encode(response.content).decode('utf-8')
+        # Custom HTML Audio Player with Autoplay and Controls
+        html_player = f"""
+        <div style="margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 10px;">
+            <audio controls autoplay style="width: 100%; height: 35px; border-radius: 20px;">
+                <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
+                Your browser does not support the audio element.
+            </audio>
+        </div>
+        """
+        return html_player
+    except Exception as e:
+        return f"<div style='color:red; font-size:12px;'>خطأ في توليد الصوت: {e}</div>"
 
 def transcribe_audio(audio_bytes):
     api_key = get_setting('openai_api_key')
@@ -284,8 +288,8 @@ def process_documents(uploaded_files):
         return len(all_docs)
     return 0
 
-# ==========================================
-# 6. واجهات المستخدم (Views)
+## ==========================================
+# 6. واجهات النظام (Views)
 # ==========================================
 if 'user_id' not in st.session_state:
     st.session_state.update({'logged_in': False, 'role': None, 'user_id': None, 'username': None, 'current_session': None})
@@ -294,87 +298,89 @@ def render_login():
     st.markdown("<br><br><br>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
-        st.markdown("""<div class="glass-card" style="text-align: center;">
-            <h1 style="color: #8b5cf6;">OSTA AI Enterprise</h1>
-            <p style="color: #94a3b8;">منصة التحليل والصيانة المعتمدة على الذكاء الاصطناعي</p>
-            <hr style="border-color: rgba(255,255,255,0.1);"></div>""", unsafe_allow_html=True)
+        st.markdown("""
+            <div style="text-align: center; margin-bottom: 30px;">
+                <i class="fa-brands fa-whatsapp" style="font-size: 5rem; color: #00a884;"></i>
+                <h1 style="color: #e9edef; font-size: 2rem;">OSTA Chat</h1>
+                <p style="color: #8696a0;">بوابة دخول النظام الصناعي</p>
+            </div>
+        """, unsafe_allow_html=True)
         
-        user = st.text_input("👤 اسم المستخدم")
-        pwd = st.text_input("🔒 كلمة المرور", type="password")
-        if st.button("تسجيل الدخول 🚀"):
-            c = conn.cursor()
-            c.execute("SELECT id, role FROM users WHERE username=? AND password=?", (user, hashlib.sha256(pwd.encode()).hexdigest()))
-            res = c.fetchone()
-            if res:
-                st.session_state.update({'logged_in': True, 'user_id': res[0], 'role': res[1], 'username': user})
+        user = st.text_input("اسم المستخدم", placeholder="أدخل اسم المستخدم هنا")
+        pwd = st.text_input("كلمة المرور", type="password", placeholder="••••••••")
+        if st.button("تسجيل الدخول"):
+            if db is None:
+                st.error("قاعدة البيانات غير متصلة.")
+                return
+            hashed_pwd = hashlib.sha256(pwd.encode()).hexdigest()
+            users_ref = list(db.collection('users').where('username', '==', user).where('password', '==', hashed_pwd).limit(1).stream())
+            
+            if users_ref:
+                user_data = users_ref[0].to_dict()
+                st.session_state.update({'logged_in': True, 'user_id': users_ref[0].id, 'role': user_data['role'], 'username': user})
                 st.rerun()
             else:
-                st.error("❌ بيانات الدخول غير صحيحة.")
+                st.error("بيانات الدخول غير صحيحة.")
 
 def render_admin_dashboard():
     with st.sidebar:
-        st.markdown(f"### 👋 أهلاً، {st.session_state['username']}")
-        menu = st.radio("القائمة:", ["📊 لوحة التحكم والإحصائيات", "👥 إدارة المستخدمين (Tenants)", "⚙️ الإعدادات والـ APIs", "📚 محرك المعرفة (RAG)"])
+        st.markdown(f"<div class='icon-title'><i class='fa-solid fa-user-shield'></i> أهلاً، {st.session_state['username']}</div>", unsafe_allow_html=True)
+        menu = st.radio("", [
+            "📊 لوحة التحكم والإحصائيات", 
+            "👥 إدارة المستخدمين", 
+            "⚙️ الإعدادات المتقدمة", 
+            "📚 قاعدة البيانات والتدريب"
+        ])
         st.markdown("<div class='btn-logout'>", unsafe_allow_html=True)
-        if st.button("🚪 تسجيل الخروج"):
+        if st.button("تسجيل الخروج"):
             st.session_state.clear()
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    if menu == "📊 لوحة التحكم والإحصائيات":
-        st.markdown("<h2>📊 نظرة عامة على النظام</h2>", unsafe_allow_html=True)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users WHERE role='Worker'")
-        workers_count = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM messages")
-        msgs_count = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM alerts")
-        alerts_count = c.fetchone()[0]
+    if "إحصائيات" in menu:
+        st.markdown("<div class='icon-title'><i class='fa-solid fa-chart-line'></i> لوحة تحكم النظام</div>", unsafe_allow_html=True)
+        if db is None: return
+        
+        workers_count = sum(1 for _ in db.collection('users').where('role', '==', 'Worker').stream())
+        msgs_count = sum(1 for _ in db.collection('messages').stream())
+        sessions_count = sum(1 for _ in db.collection('chat_sessions').stream())
         
         col1, col2, col3 = st.columns(3)
-        with col1: st.markdown(f"<div class='metric-box'><div class='metric-value'>{workers_count}</div><div class='metric-title'>العمال المسجلين</div></div>", unsafe_allow_html=True)
-        with col2: st.markdown(f"<div class='metric-box'><div class='metric-value'>{msgs_count}</div><div class='metric-title'>إجمالي الرسائل</div></div>", unsafe_allow_html=True)
-        with col3: st.markdown(f"<div class='metric-box'><div class='metric-value'>{alerts_count}</div><div class='metric-title'>تنبيهات الأعطال التلقائية</div></div>", unsafe_allow_html=True)
-        
-        st.markdown("<br><h3>🚨 أحدث تنبيهات النظام (Cron Alerts)</h3>", unsafe_allow_html=True)
-        c.execute("SELECT title, content, timestamp FROM alerts ORDER BY timestamp DESC LIMIT 5")
-        alerts = c.fetchall()
-        for a in alerts:
-            st.error(f"**{a[2]} | {a[0]}**\n\n{a[1]}")
-            
-    elif menu == "👥 إدارة المستخدمين (Tenants)":
-        st.markdown("<h2>👥 إدارة فرق العمل</h2>", unsafe_allow_html=True)
+        with col1: st.markdown(f"<div class='metric-box'><div class='metric-value'>{workers_count}</div><div class='metric-title'>فرق العمل</div></div>", unsafe_allow_html=True)
+        with col2: st.markdown(f"<div class='metric-box'><div class='metric-value'>{msgs_count}</div><div class='metric-title'>إجمالي الرسائل المرسلة</div></div>", unsafe_allow_html=True)
+        with col3: st.markdown(f"<div class='metric-box'><div class='metric-value'>{sessions_count}</div><div class='metric-title'>جلسات المحادثة</div></div>", unsafe_allow_html=True)
+
+    elif "المستخدمين" in menu:
+        st.markdown("<div class='icon-title'><i class='fa-solid fa-users-cog'></i> إدارة المستخدمين</div>", unsafe_allow_html=True)
+        if db is None: return
         with st.form("add_user"):
             nu = st.text_input("اسم المستخدم الجديد")
             np = st.text_input("كلمة المرور", type="password")
             nr = st.selectbox("الصلاحية", ["Worker", "Manager"])
             if st.form_submit_button("إضافة مستخدم"):
-                try:
-                    c = conn.cursor()
-                    c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (nu, hashlib.sha256(np.encode()).hexdigest(), nr))
-                    conn.commit()
-                    st.success("تم الإضافة بنجاح!")
-                except sqlite3.IntegrityError:
-                    st.error("اسم المستخدم موجود بالفعل.")
+                if list(db.collection('users').where('username', '==', nu).limit(1).stream()):
+                    st.error("المستخدم موجود بالفعل.")
+                else:
+                    db.collection('users').add({'username': nu, 'password': hashlib.sha256(np.encode()).hexdigest(), 'role': nr})
+                    st.success("تم بنجاح!")
         
-        st.markdown("### المستخدمين الحاليين")
-        c = conn.cursor()
-        users = c.execute("SELECT id, username, role FROM users").fetchall()
+        st.markdown("---")
+        users = db.collection('users').stream()
         for u in users:
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"🆔 **{u[1]}** ({u[2]})")
-            if u[1] != 'admin' and col2.button("حذف", key=f"del_{u[0]}"):
-                c.execute("DELETE FROM users WHERE id=?", (u[0],))
-                conn.commit()
+            u_data = u.to_dict()
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"<i class='fa-solid fa-user'></i> **{u_data['username']}** ({u_data['role']})", unsafe_allow_html=True)
+            if u_data['username'] != 'admin' and c2.button("حذف", key=f"del_{u.id}"):
+                db.collection('users').document(u.id).delete()
                 st.rerun()
 
-    elif menu == "⚙️ الإعدادات والـ APIs":
-        st.markdown("<h2>⚙️ إعدادات الذكاء الاصطناعي</h2>", unsafe_allow_html=True)
-        t1, t2 = st.tabs(["مقدمي الخدمة (Providers)", "شخصية الأسطى و TTS"])
+    elif "الإعدادات" in menu:
+        st.markdown("<div class='icon-title'><i class='fa-solid fa-sliders'></i> الإعدادات والتكوين</div>", unsafe_allow_html=True)
+        t1, t2, t3 = st.tabs(["🤖 إعدادات المحرك (LLM)", "🗣️ الشخصية والصوت (Persona)", "🔎 خوارزميات البحث (RAG)"])
+        
         with t1:
-            provider = st.selectbox("المحرك الأساسي (LLM Provider)", ["OpenAI", "Google Gemini", "Anthropic", "Custom URL"], index=["OpenAI", "Google Gemini", "Anthropic", "Custom URL"].index(get_setting('llm_provider', 'OpenAI')))
+            provider = st.selectbox("المزود (Provider)", ["OpenAI", "Google Gemini", "Anthropic", "Custom URL"], index=["OpenAI", "Google Gemini", "Anthropic", "Custom URL"].index(get_setting('llm_provider', 'OpenAI')))
             set_setting('llm_provider', provider)
-            
             if provider == "OpenAI":
                 set_setting('openai_api_key', st.text_input("OpenAI API Key", get_setting('openai_api_key'), type="password"))
                 set_setting('llm_model', st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0 if get_setting('llm_model')=='gpt-4o' else 1))
@@ -389,120 +395,117 @@ def render_admin_dashboard():
                 set_setting('custom_api_key', st.text_input("API Key (Optional)", get_setting('custom_api_key', 'dummy'), type="password"))
                 set_setting('custom_model', st.text_input("Model Name", get_setting('custom_model', 'llama3')))
                 
-            set_setting('pinecone_api_key', st.text_input("Pinecone API Key (For RAG)", get_setting('pinecone_api_key'), type="password"))
-            set_setting('temperature', st.slider("Temperature", 0.0, 1.0, float(get_setting('temperature', 0.2))))
+            set_setting('pinecone_api_key', st.text_input("Pinecone API Key", get_setting('pinecone_api_key'), type="password"))
+            set_setting('temperature', st.slider("مستوى الإبداع (Temperature)", 0.0, 1.0, float(get_setting('temperature', 0.2))))
             
         with t2:
-            set_setting('system_prompt', st.text_area("System Prompt", get_setting('system_prompt'), height=150))
-            set_setting('use_openai_tts', st.checkbox("استخدام OpenAI للصوت (إن وجد، وإلا سيستخدم المجاني)", value=(get_setting('use_openai_tts', 'True')=='True')))
-            set_setting('tts_voice', st.selectbox("نبرة الصوت", ["onyx", "echo", "alloy"], index=0))
+            set_setting('system_prompt', st.text_area("تعليمات الذكاء الاصطناعي (System Prompt)", get_setting('system_prompt'), height=150))
+            set_setting('use_openai_tts', st.checkbox("تفعيل النطق التلقائي (Auto-TTS)", value=(get_setting('use_openai_tts', 'True')=='True')))
+            set_setting('tts_voice', st.selectbox("نبرة الصوت (OpenAI Voices)", ["onyx", "echo", "alloy", "fable", "nova", "shimmer"], index=0))
 
-    elif menu == "📚 محرك المعرفة (RAG)":
-        st.markdown("<h2>📚 إدارة الداتا وتدريب المحرك</h2>", unsafe_allow_html=True)
+        with t3:
+            set_setting('chunk_size', st.number_input("حجم القطعة (Chunk Size)", value=int(get_setting('chunk_size', 1000))))
+            set_setting('chunk_overlap', st.number_input("التداخل (Chunk Overlap)", value=int(get_setting('chunk_overlap', 150))))
+            set_setting('k_results', st.number_input("عدد النتائج المسترجعة (K)", value=int(get_setting('k_results', 4))))
+
+    elif "التدريب" in menu:
+        st.markdown("<div class='icon-title'><i class='fa-solid fa-database'></i> مركز المعرفة (Knowledge Base)</div>", unsafe_allow_html=True)
         set_setting('index_name', st.text_input("Pinecone Index Name", get_setting('index_name')))
-        col1, col2 = st.columns(2)
-        set_setting('chunk_size', col1.number_input("Chunk Size", value=int(get_setting('chunk_size', 1000))))
-        set_setting('k_results', col2.number_input("K-Results", value=int(get_setting('k_results', 4))))
-        
-        uf = st.file_uploader("ارفع الملفات", accept_multiple_files=True)
-        if st.button("معالجة ورفع لـ Pinecone"):
+        uf = st.file_uploader("ارفع أدلة الصيانة والتشغيل (PDF, TXT, DOCX)", accept_multiple_files=True)
+        if st.button("تحديث الذاكرة"):
             if uf and get_setting('pinecone_api_key'):
-                with st.spinner("جاري المعالجة..."):
+                with st.spinner("جاري الحقن في قاعدة البيانات..."):
                     cnt = process_documents(uf)
-                    st.success(f"تم رفع {cnt} مقطع!")
+                    st.success(f"تم حقن {cnt} وحدة معرفية بنجاح.")
             else:
-                st.error("تأكد من إرفاق ملفات وإدخال مفتاح Pinecone.")
+                st.error("مفاتيح أو ملفات مفقودة.")
 
-def render_worker_chat():
-    c = conn.cursor()
+#def render_worker_chat():
+    if db is None: return
     uid = st.session_state['user_id']
     
-    # إدارة الجلسات في الشريط الجانبي
+    # Sidebar (Chats List)
     with st.sidebar:
-        st.markdown("### 🗂️ سجل المحادثات")
+        st.markdown("<div style='text-align:center; padding:10px;'><i class='fa-brands fa-whatsapp' style='font-size:3rem; color:#00a884;'></i><br><b style='font-size:1.2rem; color:#e9edef;'>محادثاتي</b></div>", unsafe_allow_html=True)
         if st.button("➕ محادثة جديدة"):
-            c.execute("INSERT INTO chat_sessions (user_id, title, created_at) VALUES (?, ?, datetime('now'))", (uid, "استشارة جديدة"))
-            conn.commit()
-            st.session_state['current_session'] = c.lastrowid
+            res = db.collection('chat_sessions').add({'user_id': uid, 'title': f"استشارة {datetime.now().strftime('%H:%M')}", 'created_at': datetime.now()})
+            st.session_state['current_session'] = res[1].id
             st.rerun()
             
-        sessions = c.execute("SELECT id, title FROM chat_sessions WHERE user_id=? ORDER BY created_at DESC", (uid,)).fetchall()
-        if not sessions:
-            st.info("لا توجد محادثات سابقة.")
-            
-        for sid, title in sessions:
-            col1, col2 = st.columns([4, 1])
-            if col1.button(f"💬 {title}", key=f"sess_{sid}"):
-                st.session_state['current_session'] = sid
+        sessions = list(db.collection('chat_sessions').where('user_id', '==', uid).stream())
+        sessions.sort(key=lambda x: x.to_dict().get('created_at', ''), reverse=True)
+        
+        for sess in sessions:
+            s_data = sess.to_dict()
+            c1, c2 = st.columns([4, 1])
+            if c1.button(f"💬 {s_data['title'][:15]}", key=f"sess_{sess.id}"):
+                st.session_state['current_session'] = sess.id
                 st.rerun()
-            if col2.button("🗑️", key=f"del_{sid}"):
-                c.execute("DELETE FROM chat_sessions WHERE id=?", (sid,))
-                c.execute("DELETE FROM messages WHERE session_id=?", (sid,))
-                conn.commit()
-                if st.session_state['current_session'] == sid: st.session_state['current_session'] = None
+            if c2.button("🗑️", key=f"del_{sess.id}"):
+                db.collection('chat_sessions').document(sess.id).delete()
+                for m in db.collection('messages').where('session_id', '==', sess.id).stream():
+                    db.collection('messages').document(m.id).delete()
+                if st.session_state['current_session'] == sess.id: st.session_state['current_session'] = None
                 st.rerun()
                 
-        st.markdown("<div class='btn-logout'>", unsafe_allow_html=True)
-        if st.button("تسجيل خروج"):
+        st.markdown("<div class='btn-logout' style='position:absolute; bottom:10px; width:90%;'>", unsafe_allow_html=True)
+        if st.button("خروج"):
             st.session_state.clear()
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # إنشاء جلسة افتراضية إذا لم تكن موجودة
-    if not st.session_state['current_session']:
-        if sessions:
-            st.session_state['current_session'] = sessions[0][0]
+    # Auto Create Session
+    if not st.session_state.get('current_session'):
+        if sessions: st.session_state['current_session'] = sessions[0].id
         else:
-            c.execute("INSERT INTO chat_sessions (user_id, title, created_at) VALUES (?, ?, datetime('now'))", (uid, "استشارة جديدة"))
-            conn.commit()
-            st.session_state['current_session'] = c.lastrowid
+            res = db.collection('chat_sessions').add({'user_id': uid, 'title': f"محادثة {datetime.now().strftime('%H:%M')}", 'created_at': datetime.now()})
+            st.session_state['current_session'] = res[1].id
 
     sid = st.session_state['current_session']
     
-    # عرض الرسائل السابقة
-    st.markdown("<h2>🛠️ ورشة الأسطى للذكاء الاصطناعي</h2>", unsafe_allow_html=True)
-    msgs = c.execute("SELECT role, content, image_b64 FROM messages WHERE session_id=? ORDER BY timestamp ASC", (sid,)).fetchall()
+    # Chat Area
+    msgs = list(db.collection('messages').where('session_id', '==', sid).stream())
+    msgs.sort(key=lambda x: x.to_dict().get('timestamp', ''))
     
-    for role, content, img_b64 in msgs:
-        if role == 'user':
+    for m in msgs:
+        m_data = m.to_dict()
+        if m_data['role'] == 'user':
             with st.chat_message("user"):
-                st.write(content)
-                if img_b64: st.image(base64.b64decode(img_b64))
+                st.markdown(m_data['content'])
+                if m_data.get('image_b64'): st.image(base64.b64decode(m_data['image_b64']))
         else:
             with st.chat_message("assistant"):
-                st.write(content)
+                st.markdown(m_data['content'])
+                if m_data.get('audio_html'): st.markdown(m_data['audio_html'], unsafe_allow_html=True)
 
-    # أدوات الإدخال (صوت، صورة، نص)
-    st.markdown("---")
-    col_mic, col_cam, col_txt = st.columns([1, 1, 3])
+    st.markdown("<div style='height: 100px;'></div>", unsafe_allow_html=True) # Spacer
+
+    # Bottom Input Bar (WhatsApp Style)
+    col_tools, col_input = st.columns([1, 5])
     
-    audio_bytes = None
-    with col_mic: audio_bytes = audio_recorder("🔴 سجل صوت", icon_size="2x")
-    with col_cam: img_file = st.camera_input("📸 صور العطل", label_visibility="collapsed")
+    with col_tools:
+        with st.popover("📎"):
+            audio_bytes = audio_recorder("🎙️ سجل رسالة صوتية", icon_size="2x", neutral_color="#8696a0", recording_color="#00a884")
+            img_file = st.camera_input("📸 صورة")
+            
+    prompt = st.chat_input("اكتب رسالة...")
     
-    user_text = st.chat_input("أو اكتب مشكلتك هنا...")
-    
-    prompt = user_text
     if audio_bytes and get_setting('openai_api_key'):
-        with st.spinner("جاري تفريغ الصوت..."): prompt = transcribe_audio(audio_bytes)
-        
+        with st.spinner("جاري الاستماع..."): prompt = transcribe_audio(audio_bytes)
+
     if prompt or img_file:
         img_b64 = base64.b64encode(img_file.getvalue()).decode() if img_file else None
         
-        # حفظ وعرض رسالة المستخدم
+        # Display User Input
         with st.chat_message("user"):
-            st.write(prompt)
+            st.markdown(prompt)
             if img_file: st.image(img_file)
             
         db.collection('messages').add({
-            'session_id': sid, 
-            'role': 'user', 
-            'content': prompt, 
-            'image_b64': img_b64, 
-            'timestamp': datetime.now()
+            'session_id': sid, 'role': 'user', 'content': prompt, 'image_b64': img_b64, 'timestamp': datetime.now()
         })
         
-        # جلب السياق من Pinecone
+        # Fetch RAG Context
         context = ""
         if get_setting('pinecone_api_key'):
             try:
@@ -514,35 +517,29 @@ def render_worker_chat():
                 context = "\n\n".join([d.page_content for d in docs])
             except: pass
 
-        # تجهيز الرسالة للمحرك
         sys_msg = get_setting('system_prompt')
-        full_prompt = f"المعلومات المرفقة:\n{context}\n\nسؤال العامل: {prompt}"
-        
+        full_prompt = f"المعلومات:\n{context}\n\nالسؤال: {prompt}"
         lc_msgs = [{"role": "system", "content": sys_msg}]
         if img_b64:
             lc_msgs.append({"role": "user", "content": [{"type": "text", "text": full_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]})
         else:
             lc_msgs.append({"role": "user", "content": full_prompt})
 
-        # توليد الرد بشكل حي (Streaming)
+        # Display AI Stream & Generate TTS
         with st.chat_message("assistant"):
             try:
                 llm = get_llm()
-                # st.write_stream يعرض الكلمات تباعاً
                 answer = st.write_stream(llm.stream(lc_msgs)) 
                 
+                # Generate Audio Player
+                audio_html = generate_audio_player_html(answer)
+                if audio_html: st.markdown(audio_html, unsafe_allow_html=True)
+                
                 db.collection('messages').add({
-                    'session_id': sid, 
-                    'role': 'assistant', 
-                    'content': answer, 
-                    'timestamp': datetime.now()
+                    'session_id': sid, 'role': 'assistant', 'content': answer, 'audio_html': audio_html, 'timestamp': datetime.now()
                 })
-                
-                # نطق الرد
-                speak_text(answer)
-                
             except Exception as e:
-                st.error(f"خطأ في محرك الذكاء الاصطناعي: {e}")
+                st.error(f"خطأ في الاتصال بالمحرك: {e}")
 
 def main():
     if not st.session_state['logged_in']:
