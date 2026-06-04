@@ -284,43 +284,27 @@ def init_firebase_connection():
     global db
     if not firebase_admin._apps:
         try:
-            if os.path.exists(FIREBASE_CREDS_FILE):
+            # 1. القراءة التلقائية المباشرة من Streamlit Secrets
+            if "FIREBASE_CREDENTIALS" in st.secrets:
+                cred_dict = json.loads(st.secrets["FIREBASE_CREDENTIALS"])
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+            # 2. كبديل: القراءة من ملف محلي إن وجد
+            elif os.path.exists(FIREBASE_CREDS_FILE):
                 cred = credentials.Certificate(FIREBASE_CREDS_FILE)
                 firebase_admin.initialize_app(cred)
             else:
-                return False
+                st.error("لم يتم العثور على بيانات اتصال Firebase. يرجى إضافتها في Streamlit Secrets تحت اسم FIREBASE_CREDENTIALS.")
+                st.stop()
         except Exception as e:
             st.error(f"خطأ في التهيئة السحابية: {str(e)}")
-            return False
+            st.stop()
+            
     db = firestore.client()
     return True
 
-if not os.path.exists(FIREBASE_CREDS_FILE) or not init_firebase_connection():
-    st.markdown("<div style='height: 5vh;'></div>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.markdown(f"<div style='text-align: center; margin-bottom: 20px;'>{SVGS['database']}</div>", unsafe_allow_html=True)
-        st.markdown("<h1 style='text-align: center; color: #fafafa; font-size: 28px;'>تهيئة خوادم النظام (Firebase Setup)</h1>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center; color: #a1a1aa;'>يرجى لصق كود مصادقة Firebase Service Account (JSON) لربط المنصة بالسحابة.</p>", unsafe_allow_html=True)
-        
-        firebase_json_input = st.text_area("أدخل كود JSON هنا", height=300, placeholder='{"type": "service_account", "project_id": "...", ...}')
-        
-        if st.button("حفظ وتأسيس قاعدة البيانات", type="primary", use_container_width=True):
-            if firebase_json_input.strip() == "":
-                st.error("الكود فارغ!")
-            else:
-                try:
-                    parsed_json = json.loads(firebase_json_input)
-                    with open(FIREBASE_CREDS_FILE, "w", encoding="utf-8") as f:
-                        json.dump(parsed_json, f)
-                    st.success("تم الحفظ بنجاح! جاري إقلاع النظام...")
-                    time.sleep(2)
-                    st.rerun()
-                except json.JSONDecodeError:
-                    st.error("الكود المدخل ليس بتنسيق JSON صحيح.")
-                except Exception as e:
-                    st.error(f"حدث خطأ غير متوقع: {str(e)}")
-    st.stop() # إيقاف التنفيذ حتى يتم الإعداد
+# تشغيل التهيئة التلقائية الصامتة (بدون واجهة مستخدم للإعداد)
+init_firebase_connection()
 
 users_collection = db.collection("users")
 if len(list(users_collection.limit(1).stream())) == 0:
@@ -660,7 +644,7 @@ def render_chat_kiosk():
                     elif provider == "openai":
                         key = decrypt_data(SYSTEM_CONFIG.get("openai_api_key", ""))
                         if not key: raise ValueError("مفتاح OpenAI API مفقود في الإعدادات.")
-                        llm = ChatOpenAI(model=model_name, openai_api_key=key, temperature=0.3)
+                        llm = ChatOpenAI(model_name=model_name, openai_api_key=key, temperature=0.3)
                     elif provider == "anthropic":
                         key = decrypt_data(SYSTEM_CONFIG.get("anthropic_api_key", ""))
                         if not key: raise ValueError("مفتاح Anthropic API مفقود في الإعدادات.")
