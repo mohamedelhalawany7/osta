@@ -1,39 +1,4 @@
 
-المهمة: أنت مهندس برمجيات محترف وخبير UI/UX عالمي. مطلوب بناء تطبيق Streamlit متكامل لإدارة المعرفة الصناعية (Industrial Knowledge RAG).
-
-قاعدة صارمة: لا تستخدم Diffs. اكتب الكود كاملاً في كتلة واحدة (Canvas).
-
-المواصفات التقنية:
-1. التصميم (Glassmorphism & Neon): استخدم CSS Injection متقدم (Glassmorphism effect) بخلفيات داكنة، حواف نيون مضيئة (Cyan & Electric Purple)، وتأثيرات زجاجية شبه شفافة. التصميم يجب أن يكون تجاوبياً (Responsive) بالكامل للموبايل والتابلت والكمبيوتر.
-2. قاعدة البيانات (Firebase Integration): استخدم firebase-admin لإدارة دخول العمال والمديرين. المدير له لوحة تحكم كاملة، والعامل له واجهة تسجيل دخول بسيطة.
-3. نظام الـ RAG (Pinecone & LangChain): 
-   - واجهة المدير: رفع ملفات (PDF/DOCX/TXT) -> معالجة -> تخزين في Pinecone.
-   - إمكانية حذف الملفات أو تحديثها من داخل واجهة المدير.
-4. الشات الصوتي (Voice-First RAG): 
-   - استخدام audio_recorder_streamlit لتسجيل المشكلة.
-   - تحويل الصوت لنص عبر OpenAI Whisper.
-   - استرجاع الإجابة من Pinecone + LLM بشخصية (الأسطى كبير).
-   - تحويل الرد لنص صوتي عبر ElevenLabs API أو gTTS بصوت مصري عامي صنايعي.
-5. الهيكلة (Navigation): استخدام st.sidebar أو Navigation Bar احترافي للتنقل السلس بين (الشات، الإعدادات، رفع البيانات).
-
-هيكل الكود المطلوب:
-- استيراد المكتبات (Streamlit, Firebase, Pinecone, LangChain, OpenAI, etc).
-- إعدادات الـ CSS النيوني (Glassmorphism).
-- نظام Session State لإدارة الدخول (المدير/العامل).
-- دالة process_file لرفع وتحويل الداتا لـ Vectors.
-- دالة chat_interface التي تتعامل مع الصوت وتستدعي شخصية "الأسطى كبير".
-- دالة admin_panel لإدارة الـ API Keys وقاعدة البيانات.
-
-اكتب الكود كاملاً وموثقاً (Production-Ready) مع قائمة requirements.txt اللازمة.
-
-Show more
-8:53 PM
-أكيد. هذا ملف واحد كامل app.py، وفي آخره قائمة requirements.txt كتعليق حتى يبقى كل شيء داخل Canvas واحد بدون Diffs.
-
-# app.py
-# Industrial Knowledge RAG - Streamlit Glassmorphism Voice-First App
-# Roles: Admin / Worker
-# Stack: Streamlit, Firebase Admin, Pinecone, LangChain, OpenAI Whisper, gTTS / ElevenLabs
 
 import os
 import io
