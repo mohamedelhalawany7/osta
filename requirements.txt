@@ -5,8 +5,12 @@ langchain-openai
 langchain-pinecone
 langchain-community
 langchain-text-splitters
+langchain-google-genai
+langchain-anthropic
 openai
 audio-recorder-streamlit
 pypdf
 docx2txt
 tiktoken
+apscheduler
+firebase-admin
