@@ -7,10 +7,9 @@ aiosqlite
 asyncpg
 aiomysql
 bcrypt
-python-jose
+python-jose[cryptography]
 cryptography
 pydantic
-passlib
 slowapi
 tenacity
 apscheduler
@@ -30,3 +29,4 @@ firebase-admin
 google-generativeai
 streamlit
 requests
+filetype
