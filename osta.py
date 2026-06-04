@@ -131,17 +131,18 @@ if IS_PRODUCTION:
 else:
     SQLALCHEMY_DATABASE_URL = Vault.get_secret("DATABASE_URL", "sqlite+aiosqlite:///./workshop_db.sqlite")
 
-# تم إزالة كاش Streamlit لتفادي خطأ st.set_page_config الفادح وتعارض خيوط asyncio
-def get_db_setup(db_url):
+# استخدام كاش Streamlit لمنع استنزاف الاتصالات بقاعدة البيانات مع كل تحديث للواجهة
+@st.cache_resource
+def get_db_setup(_db_url):
     engine_kwargs = {"echo": False}
-    if not db_url.startswith("sqlite"):
+    if not _db_url.startswith("sqlite"):
         engine_kwargs.update({
             "pool_size": int(Vault.get_secret("DB_POOL_SIZE", 5)),       
             "max_overflow": int(Vault.get_secret("DB_MAX_OVERFLOW", 10)),
             "pool_recycle": 1800,                                        
             "pool_pre_ping": True                                        
         })
-    _engine = create_async_engine(db_url, **engine_kwargs)
+    _engine = create_async_engine(_db_url, **engine_kwargs)
     _SessionLocal = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
     return _engine, _SessionLocal
 
@@ -2190,7 +2191,6 @@ async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSessi
 # واجهة Streamlit السحرية (تم دمج واجهة الكشك الأصلية هنا بالكامل)
 # =====================================================================
 if __name__ == "__main__":
-    import streamlit as st
     st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
 
     def is_server_running(port=8000):
@@ -2201,11 +2201,19 @@ if __name__ == "__main__":
         if not is_server_running():
             def run_server():
                 try:
-                    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+                    # 1. إنشاء Event Loop مستقل تماماً للخيط الفرعي لتجنب تجميد (Block) واجهة Streamlit
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    # 2. تمرير loop="asyncio" لمنع uvicorn من محاولة إنشاء loop متضارب
+                    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning", loop="asyncio")
                     server = uvicorn.Server(config)
-                    # ✅ الحل السحري: منع uvicorn من التلاعب بإشارات النظام لتفادي الانهيار في الخيوط الفرعية
+                    
+                    # 3. منع uvicorn من التقاط إشارات النظام (SIGINT/SIGTERM) لعدم إيقاف Streamlit
                     server.install_signal_handlers = lambda: None
-                    server.run()
+                    
+                    # 4. تشغيل الخادم بشكل آمن ومستقل داخل الـ Loop المعزول
+                    loop.run_until_complete(server.serve())
                 except Exception as e:
                     logger.error(f"Failed to start backend server: {e}")
 
