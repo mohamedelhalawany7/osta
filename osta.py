@@ -1,312 +1,296 @@
 import streamlit as st
 import time
-import base64
-import os
-# سيتم استخدام هذه المكتبات عند توفر الـ API Keys
-# import openai
-# import pinecone
-# import firebase_admin
-# from firebase_admin import credentials, auth, firestore
 
 # ==========================================
 # 1. إعدادات الصفحة الأساسية
 # ==========================================
 st.set_page_config(
-    page_title="مساعد الورشة الذكي | AI Workshop",
+    page_title="المساعد الذكي المتقدم",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ==========================================
+# 2. مكتبة الأيقونات (SVG Neon Icons)
 # ==========================================
 SVGS = {
-    "gear": """<svg width="35" height="35" viewBox="0 0 24 24" fill="none" stroke="#00f3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 8px rgba(0,243,255,0.8));"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>""",
-    "mic": """<svg width="35" height="35" viewBox="0 0 24 24" fill="none" stroke="#ff00ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 8px rgba(255,0,255,0.8));"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>""",
-    "folder": """<svg width="35" height="35" viewBox="0 0 24 24" fill="none" stroke="#00f3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 8px rgba(0,243,255,0.8));"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>""",
-    "user": """<svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="#00f3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 10px rgba(0,243,255,0.6));"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>"""
+    "chat": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 5px rgba(0,243,255,0.8));"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>""",
+    "settings": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 5px rgba(255,0,255,0.8));"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>""",
+    "database": """<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 5px rgba(0,255,136,0.8));"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>""",
+    "user": """<svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="#00f3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 10px rgba(0,243,255,0.6));"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>""",
+    "attach": """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#00f3ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>""",
+    "logout": """<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff0044" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>"""
 }
 
 # ==========================================
-# 2. تصميم CSS (Glassmorphism & Neon)
+# 3. محرك التصميم (CSS Master Engine)
 # ==========================================
-def inject_custom_css():
+def inject_premium_css():
     st.markdown("""
         <style>
-        /* خلفية التطبيق داكنة */
+        /* 1. إعدادات اللغة وتوجيه الشاشة لليمين (RTL) */
         .stApp {
-            background-color: #0d1117;
-            background-image: radial-gradient(circle at 50% 0%, #1a202c 0%, #0d1117 100%);
-            color: #e6edf3;
-            font-family: 'Cairo', sans-serif;
+            direction: rtl;
+            background-color: #080b10;
+            background-image: radial-gradient(circle at 50% 0%, #111823 0%, #080b10 100%);
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        /* 2. نقل القائمة الجانبية لليمين */
+        [data-testid="stSidebar"] {
+            left: auto !important;
+            right: 0 !important;
+            background: rgba(8, 11, 16, 0.7) !important;
+            backdrop-filter: blur(20px) !important;
+            -webkit-backdrop-filter: blur(20px) !important;
+            border-left: 1px solid rgba(0, 243, 255, 0.15) !important;
+            border-right: none !important;
         }
         
-        /* تأثير الزجاج (Glassmorphism) للـ Sidebar */
-        [data-testid="stSidebar"] {
-            background: rgba(13, 17, 23, 0.6) !important;
-            backdrop-filter: blur(15px) !important;
-            -webkit-backdrop-filter: blur(15px) !important;
-            border-left: 1px solid rgba(0, 255, 255, 0.2);
-        }
-
-        /* نيون للأزرار */
-        .stButton>button {
+        .stApp > header {
+            right: 0 !important;
+            left: auto !important;
             background: transparent !important;
-            border: 2px solid #00f3ff !important;
-            color: #00f3ff !important;
-            border-radius: 12px !important;
-            box-shadow: 0 0 10px rgba(0, 243, 255, 0.3), inset 0 0 5px rgba(0, 243, 255, 0.2) !important;
-            transition: all 0.3s ease !important;
+        }
+
+        /* 3. تصميم أزرار التنقل (بدون نقاط، ظلال نيون) */
+        div[role="radiogroup"] > label > div:first-child {
+            display: none !important; /* إخفاء دائرة الاختيار */
+        }
+        div[role="radiogroup"] {
+            gap: 15px;
+        }
+        div[role="radiogroup"] > label {
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 12px;
+            padding: 12px 20px;
+            border-right: 4px solid transparent;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            width: 100%;
+        }
+        div[role="radiogroup"] > label:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        /* تأثير النيون عند التحديد */
+        div[role="radiogroup"] > label[data-checked="true"] {
+            background: rgba(0, 243, 255, 0.05);
+            border-right: 4px solid #00f3ff;
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.3), inset 0 0 10px rgba(0, 243, 255, 0.1);
+        }
+        div[role="radiogroup"] label p {
+            font-size: 18px !important;
             font-weight: bold !important;
+            color: #e6edf3 !important;
+            margin: 0 !important;
         }
-        .stButton>button:hover {
-            background: #00f3ff !important;
-            color: #000 !important;
-            box-shadow: 0 0 20px rgba(0, 243, 255, 0.6), inset 0 0 10px rgba(0, 243, 255, 0.4) !important;
-        }
-
-        /* تأثير الزجاج لصناديق الإدخال */
-        .stTextInput>div>div>input, .stTextArea>div>div>textarea {
-            background: rgba(255, 255, 255, 0.05) !important;
-            border: 1px solid rgba(255, 0, 255, 0.3) !important;
-            color: #fff !important;
-            border-radius: 10px !important;
-            backdrop-filter: blur(5px) !important;
-        }
-        .stTextInput>div>div>input:focus, .stTextArea>div>div>textarea:focus {
-            border: 1px solid #ff00ff !important;
-            box-shadow: 0 0 10px rgba(255, 0, 255, 0.4) !important;
+        div[role="radiogroup"] label[data-checked="true"] p {
+            color: #00f3ff !important;
+            text-shadow: 0 0 8px rgba(0, 243, 255, 0.6);
         }
 
-        /* رسائل الشات */
+        /* 4. تصميم فقاعات الشات (WhatsApp Glass Style) */
         .stChatMessage {
-            background: rgba(20, 25, 30, 0.6) !important;
-            border: 1px solid rgba(0, 255, 255, 0.1) !important;
+            background: rgba(255, 255, 255, 0.03) !important;
+            border: 1px solid rgba(255, 255, 255, 0.05) !important;
             border-radius: 15px !important;
             backdrop-filter: blur(10px) !important;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
+            padding: 15px !important;
+        }
+        /* تمييز رسائل المستخدم (الأرجواني) */
+        .stChatMessage:nth-child(even) {
+            border-right: 3px solid #ff00ff !important;
+            background: rgba(255, 0, 255, 0.03) !important;
+            box-shadow: 0 5px 15px rgba(255, 0, 255, 0.05);
+        }
+        /* تمييز رسائل الذكاء الاصطناعي (السماوي) */
+        .stChatMessage:nth-child(odd) {
+            border-right: 3px solid #00f3ff !important;
+            background: rgba(0, 243, 255, 0.03) !important;
+            box-shadow: 0 5px 15px rgba(0, 243, 255, 0.05);
         }
 
-        /* عناوين نيون */
-        h1, h2, h3 {
-            text-shadow: 0 0 10px rgba(0, 243, 255, 0.5);
+        /* 5. تصميم المدخلات والأزرار (Neon Inputs) */
+        .stTextInput>div>div>input, .stTextArea>div>div>textarea {
+            background: rgba(0, 0, 0, 0.4) !important;
+            border: 1px solid rgba(0, 243, 255, 0.3) !important;
+            color: #fff !important;
+            border-radius: 12px !important;
+        }
+        .stTextInput>div>div>input:focus {
+            border-color: #00f3ff !important;
+            box-shadow: 0 0 15px rgba(0, 243, 255, 0.4) !important;
         }
         
-        /* إخفاء القائمة العلوية الافتراضية لستريمليت لمظهر احترافي */
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
+        .stButton>button {
+            background: transparent !important;
+            border: 1px solid #00f3ff !important;
+            color: #00f3ff !important;
+            border-radius: 10px !important;
+            box-shadow: 0 0 10px rgba(0, 243, 255, 0.2) !important;
+            transition: all 0.3s !important;
+        }
+        .stButton>button:hover {
+            background: rgba(0, 243, 255, 0.1) !important;
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.5) !important;
+        }
+
+        /* إخفاء القوائم الافتراضية */
+        #MainMenu, footer, header {visibility: hidden;}
         </style>
     """, unsafe_allow_html=True)
 
-inject_custom_css()
+inject_premium_css()
 
 # ==========================================
-# 3. إدارة حالة التطبيق (Session State)
+# 4. إدارة الجلسة (Session State)
 # ==========================================
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
-if 'user_role' not in st.session_state:
-    st.session_state.user_role = None # 'admin' or 'worker'
-if 'username' not in st.session_state:
+    st.session_state.user_role = None
     st.session_state.username = ""
-if 'messages' not in st.session_state:
     st.session_state.messages = []
-if 'api_keys' not in st.session_state:
-    st.session_state.api_keys = {"openai": "", "pinecone": "", "firebase": ""}
 
 # ==========================================
-# 4. الـ System Prompt (شخصية الأسطى المصري)
-# ==========================================
-SYSTEM_PROMPT = """
-أنت 'الأسطى سيد'، مهندس وصنايعي مصري مخضرم في شركة تصنيع معدات هندسية.
-خبرتك تشمل: ماكينات CNC، المخارط، الفرايز، المقاشط، المثاقب، الليزر، اللحام، وقسم الهواء (ضواغط ومجففات).
-بتكلم العمال اللي أغلبهم مش متعلمين أوي، فلازم يكون ردك:
-- بلهجة مصرية عامية دارجة جداً ومحببة (يا هندسة، يا بطل، بص يا سيدي، صلي على النبي).
-- اجابات عملية جداً ومباشرة ومظبوطة هندسياً.
-- متستخدمش مصطلحات معقدة، بسط المعلومة على قد ما تقدر.
-- لو العامل قال مشكلة، شخصها واديله الحل خطوة بخطوة كأنك واقف جنبه على المكنة.
-"""
-
-# ==========================================
-# 5. دوال محاكاة الذكاء الاصطناعي والصوت
-# ==========================================
-def mock_ai_response(user_text):
-    """محاكاة لرد الذكاء الاصطناعي في حال عدم وضع API Key"""
-    time.sleep(1.5)
-    if "صوت" in user_text or "عالي" in user_text:
-        return "بص يا هندسة، الصوت العالي في المكنة الـ CNC غالباً معناه إن فيه بوش في الرومان بلي أو الطرد المركزي مش مظبوط. وقف المكنة فوراً وراجع على زيت التزييت واتاكد إن مفيش رايش حاشر في الـ Spindle. الله ينور عليك."
-    elif "هواء" in user_text or "كومبريسور" in user_text or "ضاغط" in user_text:
-        return "يا ريس، لو الكومبريسور مابيرفعش ضغط، أول حاجة تبص عليها هي فلاتر الهواء ممكن تكون مكتومة، وبعدين شيك على بلف السحب (Intake valve). نضفهم كويس وجرب تاني وبلغني."
-    else:
-        return "يا بطل، عشان أقدر أفيدك صح، قولي العطل في أي مكنة بالظبط؟ مخرطة ولا فريزة ولا كومبريسور؟ وإيه اللي بيحصل معاك؟"
-
-# ==========================================
-# 6. واجهة تسجيل الدخول (Authentication)
+# 5. واجهة تسجيل الدخول
 # ==========================================
 def login_page():
-    st.markdown(f"<div style='display: flex; justify-content: center; align-items: center; gap: 15px;'><h1 style='color: #00f3ff; margin:0;'>نظام إدارة الورشة الذكي</h1>{SVGS['gear']}</div>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #aaa; margin-top: 10px;'>يرجى تسجيل الدخول للوصول إلى النظام</p>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 10vh;'></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='display: flex; justify-content: center; align-items: center; gap: 15px;'><h1 style='color: #00f3ff; margin:0; font-size: 3rem;'>بوابة النظام الذكي</h1>{SVGS['database']}</div>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #888;'>يرجى المصادقة للوصول إلى مركز البيانات</p>", unsafe_allow_html=True)
     
-    col1, col2, col3 = st.columns([1, 2, 1])
+    col1, col2, col3 = st.columns([1, 1.5, 1])
     with col2:
-        with st.container():
-            st.markdown("<div class='glass-container' style='padding: 20px;'>", unsafe_allow_html=True)
-            username = st.text_input("اسم المستخدم", placeholder="أدخل الكود أو الاسم")
-            password = st.text_input("كلمة المرور", type="password", placeholder="أدخل كلمة المرور")
-            
-            if st.button("تسجيل الدخول", use_container_width=True):
-                # هنا يتم ربط Firebase Auth مستقبلاً
-                if username == "admin" and password == "admin":
-                    st.session_state.logged_in = True
-                    st.session_state.user_role = "admin"
-                    st.session_state.username = "المدير العام"
-                    st.rerun()
-                elif username == "worker" and password == "123":
-                    st.session_state.logged_in = True
-                    st.session_state.user_role = "worker"
-                    st.session_state.username = "الأسطى أحمد"
-                    st.rerun()
-                else:
-                    st.error("بيانات الدخول غير صحيحة!")
-            st.markdown("</div>", unsafe_allow_html=True)
+        username = st.text_input("معرف المستخدم")
+        password = st.text_input("رمز المرور", type="password")
+        if st.button("تسجيل الدخول", use_container_width=True):
+            if username == "admin" and password == "admin":
+                st.session_state.logged_in = True
+                st.session_state.user_role = "admin"
+                st.session_state.username = "المهندس العام"
+                st.rerun()
+            elif username == "worker" and password == "123":
+                st.session_state.logged_in = True
+                st.session_state.user_role = "worker"
+                st.session_state.username = "الأسطى أحمد"
+                st.rerun()
+            else:
+                st.error("بيانات غير مصرح بها!")
 
 # ==========================================
-# 7. واجهة المساعد الصوتي (Chat & Voice)
+# 6. واجهة الشات الاحترافية (WhatsApp Style)
 # ==========================================
 def chat_page():
-    st.markdown(f"<div style='display: flex; align-items: center; gap: 15px;'><h2 style='margin:0;'>المساعد الذكي (الأسطى سيد)</h2>{SVGS['mic']}</div>", unsafe_allow_html=True)
-    st.caption("سجل مشكلتك بصوتك أو اكتبها، والأسطى سيد هيرد عليك بالحل.")
+    st.markdown(f"<div style='display: flex; align-items: center; gap: 15px; margin-bottom: 20px;'><h2 style='margin:0; color:#00f3ff;'>غرفة الدعم الفني</h2>{SVGS['chat']}</div>", unsafe_allow_html=True)
 
-    # عرض الرسائل السابقة
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("audio"):
-                st.audio(msg["audio"])
+    # مساحة عرض الرسائل (Scrollable)
+    chat_container = st.container(height=500, border=False)
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("audio"):
+                    st.audio(msg["audio"])
 
-    # تسجيل الصوت (باستخدام ميزة Streamlit الجديدة)
-    audio_value = st.audio_input("سجل رسالتك هنا يا هندسة")
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # شريط الإدخال المدمج (واتساب ستايل)
+    input_cols = st.columns([1, 11])
     
-    # مربع الكتابة كبديل
-    text_input = st.chat_input("أو اكتب مشكلتك هنا...")
+    with input_cols[0]:
+        # زر الإرفاق (مشبك الورق) يفتح قائمة منبثقة للصور والصوت
+        with st.popover(SVGS["attach"], help="إرفاق ملف أو تسجيل صوت"):
+            st.markdown("<h4 style='color:#00f3ff; text-align:center;'>المرفقات الصوتية والمرئية</h4>", unsafe_allow_html=True)
+            audio_val = st.audio_input("تسجيل مشكلة صوتية")
+            img_val = st.file_uploader("رفع صورة للعطل", type=["png", "jpg"])
 
-    user_query = None
+    with input_cols[1]:
+        text_val = st.chat_input("اكتب رسالتك للأسطى سيد هنا...")
 
-    if audio_value:
-        # هنا يتم إرسال ملف الصوت إلى OpenAI Whisper لتحويله لنص
-        st.success("تم استلام التسجيل! جاري الترجمة...")
-        # محاكاة الترجمة
-        user_query = "صوت المكنة عالي قوي يا أسطى" 
+    # معالجة المدخلات
+    if text_val or audio_val or img_val:
+        user_text = text_val if text_val else "تم إرسال مرفق (صوت/صورة)."
         
-    if text_input:
-        user_query = text_input
-
-    if user_query:
-        # إضافة رسالة المستخدم
-        st.session_state.messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
-
-        # الرد من الذكاء الاصطناعي (مع الـ RAG)
-        with st.chat_message("assistant"):
-            with st.spinner("الأسطى سيد بيفكر..."):
-                # هنا كود الـ RAG (Pinecone + OpenAI)
-                # اذا لم يتوفر API سيتم استخدام المحاكاة
-                response_text = mock_ai_response(user_query)
-                st.markdown(response_text)
-                
-                # هنا كود تحويل النص إلى صوت TTS (مثال ElevenLabs)
-                # نقوم بمحاكاة الصوت بمكون صوت فارغ للتوضيح
-                st.caption("تشغيل الرد الصوتي:")
-                # st.audio("path_to_generated_audio.mp3") 
-                
-        st.session_state.messages.append({"role": "assistant", "content": response_text})
+        st.session_state.messages.append({"role": "user", "content": user_text})
+        
+        # رد وهمي لمحاكاة الذكاء الاصطناعي
+        ai_response = "حاضر يا هندسة، جاري فحص المشكلة بناءً على المرفقات."
+        st.session_state.messages.append({"role": "assistant", "content": ai_response})
+        
+        st.rerun() # تحديث الشاشة لعرض رسالة المستخدم فوراً
 
 # ==========================================
-# 8. إدارة الملفات والـ RAG (للمدير فقط)
-# ==========================================
-def data_management_page():
-    st.markdown(f"<div style='display: flex; align-items: center; gap: 15px;'><h2 style='margin:0;'>إدارة البيانات (Pinecone RAG)</h2>{SVGS['folder']}</div>", unsafe_allow_html=True)
-    st.info("ارفع الكتالوجات، ملفات الصيانة، وأعطال الضواغط والماكينات لتدريب المساعد الذكي.")
-
-    uploaded_files = st.file_uploader("اختر الملفات (PDF, TXT, DOCX, CSV)", accept_multiple_files=True)
-    
-    if st.button("رفع ومعالجة البيانات (Embeddings)", type="primary"):
-        if uploaded_files:
-            with st.spinner("جاري استخراج النصوص وتحويلها إلى Embeddings ورفعها لـ Pinecone..."):
-                time.sleep(2) # محاكاة وقت الرفع
-                st.success(f"تم بنجاح رفع ومعالجة {len(uploaded_files)} ملف/ملفات.")
-        else:
-            st.warning("يرجى اختيار ملفات أولاً.")
-
-    st.markdown("---")
-    st.subheader("الملفات الحالية في قاعدة البيانات")
-    
-    # محاكاة لملفات موجودة
-    files = ["كتالوج_ضاغط_أطلس_كوبكو.pdf", "أعطال_مخرطة_CNC_شائعة.txt", "دليل_مجففات_الهواء.docx"]
-    for f in files:
-        col1, col2 = st.columns([4, 1])
-        col1.markdown(f"**ملف:** `{f}`")
-        if col2.button("حذف", key=f):
-            st.toast(f"تم حذف {f} من قاعدة البيانات.")
-
-# ==========================================
-# 9. صفحة الإعدادات والربط (للمدير فقط)
+# 7. الإعدادات الشاملة وقاعدة المعرفة
 # ==========================================
 def settings_page():
-    st.markdown(f"<div style='display: flex; align-items: center; gap: 15px;'><h2 style='margin:0;'>إعدادات النظام و الـ APIs</h2>{SVGS['gear']}</div>", unsafe_allow_html=True)
-    st.caption("أدخل مفاتيح الربط لتفعيل الذكاء الاصطناعي الحقيقي وقاعدة البيانات.")
-
-    with st.expander("OpenAI API Settings (للشات وفهم الكلام)"):
-        openai_key = st.text_input("OpenAI API Key", type="password", value=st.session_state.api_keys["openai"])
+    st.markdown(f"<div style='display: flex; align-items: center; gap: 15px; margin-bottom: 20px;'><h2 style='margin:0; color:#ff00ff;'>الإعدادات المتقدمة للنظام</h2>{SVGS['settings']}</div>", unsafe_allow_html=True)
     
-    with st.expander("Pinecone Vector DB (للذاكرة والـ RAG)"):
-        pinecone_key = st.text_input("Pinecone API Key", type="password", value=st.session_state.api_keys["pinecone"])
-        pinecone_env = st.text_input("Pinecone Environment / Index Name")
+    # استخدام التابات لتنظيم الإعدادات باحترافية
+    tab1, tab2, tab3 = st.tabs(["قاعدة المعرفة", "محركات الذكاء الاصطناعي", "صلاحيات النظام"])
+    
+    with tab1:
+        st.markdown("<h3 style='color:#00f3ff;'>رفع الكتالوجات وتدريب النظام</h3>", unsafe_allow_html=True)
+        st.info("الملفات المرفوعة هنا تتم معالجتها فوراً وتحفظ في قاعدة البيانات.")
+        files = st.file_uploader("اسحب وافلت ملفات (PDF, TXT, CSV) هنا", accept_multiple_files=True)
+        if st.button("معالجة ورفع لقاعدة البيانات", use_container_width=True):
+            if files:
+                with st.spinner("جاري الحقن في قاعدة البيانات..."):
+                    time.sleep(2)
+                    st.success("تم التحديث بنجاح!")
+            else:
+                st.warning("الرجاء إرفاق ملفات أولاً.")
 
-    with st.expander("Firebase Settings (للمستخدمين وقاعدة البيانات)"):
-        st.text_area("Firebase Admin JSON", placeholder='{"type": "service_account", ...}')
+    with tab2:
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### مفاتيح الربط")
+            st.text_input("OpenAI API Key", type="password")
+            st.text_input("Pinecone API Key", type="password")
+            st.text_input("ElevenLabs API Key", type="password")
+        with colB:
+            st.markdown("#### هندسة الأوامر")
+            st.slider("مستوى إبداع الرد", 0.0, 1.0, 0.7)
+            st.text_area("تعليمات شخصية المساعد", height=150, value="أنت الأسطى سيد، خبير التشغيل المعدني...")
+            st.button("حفظ إعدادات الذكاء الاصطناعي", use_container_width=True)
 
-    with st.expander("إعدادات الصوت (Text-to-Speech)"):
-        st.selectbox("مزود الصوت", ["ElevenLabs (موصى به للصوت المصري)", "Google Cloud TTS", "OpenAI TTS"])
-        tts_key = st.text_input("TTS API Key", type="password")
-        st.text_input("Voice ID (رقم المعرف لصوت الأسطى المصري)")
-
-    if st.button("حفظ الإعدادات"):
-        st.session_state.api_keys["openai"] = openai_key
-        st.session_state.api_keys["pinecone"] = pinecone_key
-        st.success("تم حفظ الإعدادات بنجاح!")
+    with tab3:
+        st.markdown("#### إدارة المستخدمين")
+        st.text_area("Firebase Admin SDK JSON", placeholder="لصق الكود هنا...")
+        st.button("مزامنة مع السحابة", use_container_width=True)
 
 # ==========================================
-# 10. الهيكل الرئيسي للتطبيق (Main App Flow)
+# 8. الهيكل العام للتطبيق
 # ==========================================
 def main():
     if not st.session_state.logged_in:
         login_page()
     else:
-        # القائمة الجانبية المخصصة
         with st.sidebar:
-            st.markdown(f"<div style='display: flex; justify-content: center; margin-top: 20px; margin-bottom: 10px;'>{SVGS['user']}</div>", unsafe_allow_html=True)
-            st.markdown(f"<h3 style='text-align: center; margin-bottom: 0;'>مرحباً بك يا</h3><h2 style='text-align: center; color:#00f3ff; margin-top: 5px;'>{st.session_state.username}</h2>", unsafe_allow_html=True)
-            st.markdown("---")
+            st.markdown(f"<div style='display: flex; justify-content: center; margin-top: 20px;'>{SVGS['user']}</div>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='text-align: center; color:#e6edf3; margin-top: 10px;'>{st.session_state.username}</h3>", unsafe_allow_html=True)
+            st.markdown("<hr style='border-color: rgba(0, 243, 255, 0.2);'>", unsafe_allow_html=True)
             
-            # تحديد الصفحات بناءً على الصلاحيات
+            # التنقل الفاخر
             if st.session_state.user_role == "admin":
-                page = st.radio("القائمة الرئيسية", ["المساعد الذكي", "رفع البيانات", "الإعدادات"])
+                menu_options = ["الدعم الفني والتشخيص", "لوحة التحكم والإعدادات"]
             else:
-                page = st.radio("القائمة الرئيسية", ["المساعد الذكي"])
+                menu_options = ["الدعم الفني والتشخيص"]
+                
+            choice = st.radio("القائمة", menu_options, label_visibility="collapsed")
             
-            st.markdown("---")
-            if st.button("تسجيل الخروج", key="logout"):
-                st.session_state.logged_in = False
-                st.session_state.user_role = None
+            st.markdown("<hr style='border-color: rgba(0, 243, 255, 0.2);'>", unsafe_allow_html=True)
+            
+            # زر تسجيل الخروج مع تصميم مخصص
+            if st.button("إنهاء الجلسة", use_container_width=True):
+                st.session_state.clear()
                 st.rerun()
 
-        # التوجيه للصفحات
-        if page == "المساعد الذكي":
+        # عرض الصفحات
+        if choice == "الدعم الفني والتشخيص":
             chat_page()
-        elif page == "رفع البيانات" and st.session_state.user_role == "admin":
-            data_management_page()
-        elif page == "الإعدادات" and st.session_state.user_role == "admin":
+        elif choice == "لوحة التحكم والإعدادات":
             settings_page()
 
 if __name__ == "__main__":
