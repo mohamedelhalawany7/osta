@@ -29,4 +29,3 @@ firebase-admin
 google-generativeai
 streamlit
 requests
-filetype
