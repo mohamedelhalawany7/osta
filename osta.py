@@ -1,557 +1,1188 @@
-import streamlit as st
-import os
-import tempfile
-import time
-import hashlib
-import sqlite3
-import base64
-from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-import streamlit.components.v1 as components
 
-# إعدادات الصفحة الأساسية
+المهمة: أنت مهندس برمجيات محترف وخبير UI/UX عالمي. مطلوب بناء تطبيق Streamlit متكامل لإدارة المعرفة الصناعية (Industrial Knowledge RAG).
+
+قاعدة صارمة: لا تستخدم Diffs. اكتب الكود كاملاً في كتلة واحدة (Canvas).
+
+المواصفات التقنية:
+1. التصميم (Glassmorphism & Neon): استخدم CSS Injection متقدم (Glassmorphism effect) بخلفيات داكنة، حواف نيون مضيئة (Cyan & Electric Purple)، وتأثيرات زجاجية شبه شفافة. التصميم يجب أن يكون تجاوبياً (Responsive) بالكامل للموبايل والتابلت والكمبيوتر.
+2. قاعدة البيانات (Firebase Integration): استخدم firebase-admin لإدارة دخول العمال والمديرين. المدير له لوحة تحكم كاملة، والعامل له واجهة تسجيل دخول بسيطة.
+3. نظام الـ RAG (Pinecone & LangChain): 
+   - واجهة المدير: رفع ملفات (PDF/DOCX/TXT) -> معالجة -> تخزين في Pinecone.
+   - إمكانية حذف الملفات أو تحديثها من داخل واجهة المدير.
+4. الشات الصوتي (Voice-First RAG): 
+   - استخدام audio_recorder_streamlit لتسجيل المشكلة.
+   - تحويل الصوت لنص عبر OpenAI Whisper.
+   - استرجاع الإجابة من Pinecone + LLM بشخصية (الأسطى كبير).
+   - تحويل الرد لنص صوتي عبر ElevenLabs API أو gTTS بصوت مصري عامي صنايعي.
+5. الهيكلة (Navigation): استخدام st.sidebar أو Navigation Bar احترافي للتنقل السلس بين (الشات، الإعدادات، رفع البيانات).
+
+هيكل الكود المطلوب:
+- استيراد المكتبات (Streamlit, Firebase, Pinecone, LangChain, OpenAI, etc).
+- إعدادات الـ CSS النيوني (Glassmorphism).
+- نظام Session State لإدارة الدخول (المدير/العامل).
+- دالة process_file لرفع وتحويل الداتا لـ Vectors.
+- دالة chat_interface التي تتعامل مع الصوت وتستدعي شخصية "الأسطى كبير".
+- دالة admin_panel لإدارة الـ API Keys وقاعدة البيانات.
+
+اكتب الكود كاملاً وموثقاً (Production-Ready) مع قائمة requirements.txt اللازمة.
+
+Show more
+8:53 PM
+أكيد. هذا ملف واحد كامل app.py، وفي آخره قائمة requirements.txt كتعليق حتى يبقى كل شيء داخل Canvas واحد بدون Diffs.
+
+# app.py
+# Industrial Knowledge RAG - Streamlit Glassmorphism Voice-First App
+# Roles: Admin / Worker
+# Stack: Streamlit, Firebase Admin, Pinecone, LangChain, OpenAI Whisper, gTTS / ElevenLabs
+
+import os
+import io
+import json
+import time
+import uuid
+import base64
+import hashlib
+import tempfile
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import streamlit as st
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except Exception:
+    firebase_admin = None
+    credentials = None
+    firestore = None
+
+try:
+    from pinecone import Pinecone, ServerlessSpec
+except Exception:
+    Pinecone = None
+    ServerlessSpec = None
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
+    from audio_recorder_streamlit import audio_recorder
+except Exception:
+    audio_recorder = None
+
+try:
+    from gtts import gTTS
+except Exception:
+    gTTS = None
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    import docx
+except Exception:
+    docx = None
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+    from langchain_pinecone import PineconeVectorStore
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.documents import Document
+except Exception:
+    RecursiveCharacterTextSplitter = None
+    OpenAIEmbeddings = None
+    ChatOpenAI = None
+    PineconeVectorStore = None
+    ChatPromptTemplate = None
+    Document = None
+
+
+APP_NAME = "Industrial Knowledge RAG"
+DEFAULT_INDEX = "industrial-knowledge-rag"
+DEFAULT_NAMESPACE = "factory-knowledge"
+FIREBASE_COLLECTION_USERS = "users"
+FIREBASE_COLLECTION_FILES = "rag_files"
+
+
 st.set_page_config(
-    page_title="OSTA AI | Enterprise System",
+    page_title=APP_NAME,
     page_icon="⚙️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ==========================================
-# 1. إعداد قاعدة البيانات (Database Setup)
-# ==========================================
-@st.cache_resource
-def init_db():
-    conn = sqlite3.connect('osta_enterprise.db', check_same_thread=False)
-    c = conn.cursor()
-    # جداول النظام
-    c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, role TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    c.execute('CREATE TABLE IF NOT EXISTS chat_sessions (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, created_at DATETIME)')
-    c.execute('CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id INTEGER, role TEXT, content TEXT, image_b64 TEXT, timestamp DATETIME)')
-    c.execute('CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, title TEXT, content TEXT, timestamp DATETIME)')
-    
-    # المستخدمين الافتراضيين
-    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", 
-              ('admin', hashlib.sha256(b'admin2024').hexdigest(), 'Manager'))
-    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", 
-              ('worker', hashlib.sha256(b'worker').hexdigest(), 'Worker'))
-    
-    # الإعدادات الافتراضية
-    default_settings = {
-        'llm_provider': 'OpenAI',
-        'llm_model': 'gpt-4o-mini',
-        'temperature': '0.2',
-        'chunk_size': '1000',
-        'chunk_overlap': '150',
-        'k_results': '4',
-        'tts_voice': 'onyx',
-        'use_openai_tts': 'True',
-        'system_prompt': "أنت 'أسطى كبير' مصري محترف جداً في صيانة ضواغط الهواء والتصنيع المعدني. كلامك كله بلهجة صنايعية مصرية عامية بسيطة. إجابتك يجب أن تكون في خطوات مرقمة (1، 2، 3). إذا لم تكن المعلومة في النص قل 'يا ابني دي مش عندي في الكتالوج دلوقتي'. اعتمد على [المعلومات المرفقة] فقط.",
-        'index_name': 'osta-enterprise-rag'
+
+# =========================
+# CSS: Glassmorphism + Neon
+# =========================
+
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --bg-0: #050712;
+            --bg-1: #090d1f;
+            --glass: rgba(255, 255, 255, 0.075);
+            --glass-strong: rgba(255, 255, 255, 0.125);
+            --line: rgba(255, 255, 255, 0.16);
+            --cyan: #21f7ff;
+            --purple: #a855f7;
+            --pink: #ff4fd8;
+            --text: #eef7ff;
+            --muted: #9fb3c8;
+            --danger: #ff476f;
+            --ok: #33f2a0;
+        }
+
+        html, body, [data-testid="stAppViewContainer"] {
+            background:
+                radial-gradient(circle at 12% 12%, rgba(33, 247, 255, 0.18), transparent 30%),
+                radial-gradient(circle at 88% 16%, rgba(168, 85, 247, 0.20), transparent 28%),
+                radial-gradient(circle at 50% 95%, rgba(255, 79, 216, 0.12), transparent 28%),
+                linear-gradient(145deg, var(--bg-0), var(--bg-1));
+            color: var(--text);
+            font-family: Inter, Segoe UI, Tahoma, Arial, sans-serif;
+        }
+
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+
+        [data-testid="stSidebar"] {
+            background: rgba(4, 7, 18, 0.74);
+            backdrop-filter: blur(18px);
+            border-right: 1px solid rgba(33, 247, 255, 0.18);
+        }
+
+        [data-testid="stSidebar"] * {
+            color: var(--text);
+        }
+
+        .main-title {
+            font-size: clamp(2rem, 5vw, 4.3rem);
+            line-height: 1;
+            font-weight: 900;
+            letter-spacing: 0;
+            margin: 0 0 0.6rem;
+            background: linear-gradient(90deg, var(--cyan), #ffffff, var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 32px rgba(33, 247, 255, 0.24);
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: clamp(0.95rem, 2vw, 1.15rem);
+            max-width: 850px;
+            margin-bottom: 1.1rem;
+        }
+
+        .glass-card {
+            background: var(--glass);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 1.1rem;
+            box-shadow:
+                0 0 0 1px rgba(33, 247, 255, 0.05),
+                0 18px 50px rgba(0, 0, 0, 0.32),
+                inset 0 1px 0 rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(18px);
+            margin-bottom: 1rem;
+        }
+
+        .neon-card {
+            background: linear-gradient(135deg, rgba(33, 247, 255, 0.12), rgba(168, 85, 247, 0.12));
+            border: 1px solid rgba(33, 247, 255, 0.35);
+            box-shadow:
+                0 0 22px rgba(33, 247, 255, 0.16),
+                0 0 30px rgba(168, 85, 247, 0.12);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .metric-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            padding: 0.6rem 0.8rem;
+            margin: 0.2rem 0.2rem 0.2rem 0;
+            border-radius: 8px;
+            border: 1px solid rgba(33, 247, 255, 0.25);
+            background: rgba(255,255,255,0.07);
+            color: var(--text);
+            font-size: 0.92rem;
+        }
+
+        .role-pill {
+            display: inline-block;
+            border: 1px solid rgba(168, 85, 247, 0.45);
+            background: rgba(168, 85, 247, 0.12);
+            color: #f1dcff;
+            border-radius: 8px;
+            padding: 0.35rem 0.6rem;
+            font-weight: 700;
+            margin-bottom: 0.8rem;
+        }
+
+        .answer-box {
+            background: rgba(0, 0, 0, 0.25);
+            border-left: 3px solid var(--cyan);
+            border-radius: 8px;
+            padding: 1rem;
+            white-space: pre-wrap;
+            color: var(--text);
+        }
+
+        .source-box {
+            color: var(--muted);
+            font-size: 0.88rem;
+            border-top: 1px solid rgba(255,255,255,0.10);
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 8px !important;
+            border: 1px solid rgba(33, 247, 255, 0.38) !important;
+            background: linear-gradient(135deg, rgba(33, 247, 255, 0.16), rgba(168, 85, 247, 0.18)) !important;
+            color: var(--text) !important;
+            box-shadow: 0 0 18px rgba(33, 247, 255, 0.12);
+            font-weight: 800 !important;
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            border-color: rgba(33, 247, 255, 0.8) !important;
+            box-shadow: 0 0 30px rgba(33, 247, 255, 0.28);
+            transform: translateY(-1px);
+        }
+
+        input, textarea, select {
+            border-radius: 8px !important;
+        }
+
+        [data-testid="stTextInput"] input,
+        [data-testid="stTextArea"] textarea,
+        [data-testid="stNumberInput"] input {
+            background: rgba(255,255,255,0.08) !important;
+            border: 1px solid rgba(255,255,255,0.18) !important;
+            color: var(--text) !important;
+        }
+
+        [data-testid="stFileUploader"] {
+            background: rgba(255,255,255,0.06);
+            border: 1px dashed rgba(33, 247, 255, 0.35);
+            border-radius: 8px;
+            padding: 0.8rem;
+        }
+
+        .success-text { color: var(--ok); font-weight: 800; }
+        .danger-text { color: var(--danger); font-weight: 800; }
+
+        @media (max-width: 768px) {
+            .glass-card, .neon-card {
+                padding: 0.85rem;
+            }
+
+            [data-testid="column"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+            }
+
+            .main-title {
+                font-size: 2.2rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================
+# Session State
+# =========================
+
+def init_state() -> None:
+    defaults = {
+        "logged_in": False,
+        "user_id": None,
+        "username": None,
+        "role": None,
+        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "pinecone_api_key": os.getenv("PINECONE_API_KEY", ""),
+        "pinecone_index": os.getenv("PINECONE_INDEX", DEFAULT_INDEX),
+        "pinecone_namespace": os.getenv("PINECONE_NAMESPACE", DEFAULT_NAMESPACE),
+        "elevenlabs_api_key": os.getenv("ELEVENLABS_API_KEY", ""),
+        "elevenlabs_voice_id": os.getenv("ELEVENLABS_VOICE_ID", ""),
+        "chat_history": [],
     }
-    for k, v in default_settings.items():
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-        
-    conn.commit()
-    return conn
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-conn = init_db()
 
-# دوال مساعدة لقاعدة البيانات
-def get_setting(key, default=""):
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key=?", (key,))
-    res = c.fetchone()
-    return res[0] if res else default
+# =========================
+# Firebase
+# =========================
 
-def set_setting(key, value):
-    c = conn.cursor()
-    c.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
+def sha256_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-# ==========================================
-# 2. مهام الخلفية والتحليل التلقائي (Cron Jobs)
-# ==========================================
-def cron_fault_analysis():
-    c = conn.cursor()
-    yesterday = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    c.execute("SELECT content FROM messages WHERE role='user' AND timestamp >= datetime('now', '-1 day')")
-    msgs = c.fetchall()
-    
-    keywords = ['عطل', 'مشكلة', 'حرارة', 'تسريب', 'صوت', 'دخان', 'باظ', 'وقف']
-    fault_count = sum(1 for m in msgs if any(w in str(m[0]) for w in keywords))
-    
-    if fault_count > 0:
-        c.execute("INSERT INTO alerts (title, content, timestamp) VALUES (?, ?, datetime('now'))",
-                  ("تحليل الأعطال اليومي", f"تم رصد {fault_count} بلاغات من العمال تحتوي على كلمات تشير لأعطال محتملة خلال آخر 24 ساعة. يرجى مراجعة سجلات المحادثة."))
-        conn.commit()
 
-@st.cache_resource
-def start_scheduler():
-    scheduler = BackgroundScheduler()
-    # جدولة المهمة لتعمل كل يوم الساعة 2 صباحاً
-    scheduler.add_job(cron_fault_analysis, 'cron', hour=2)
-    scheduler.start()
-    return scheduler
+@st.cache_resource(show_spinner=False)
+def init_firebase():
+    if firebase_admin is None:
+        return None
 
-start_scheduler()
+    if firebase_admin._apps:
+        return firestore.client()
 
-# ==========================================
-# 3. الاعتماديات المتأخرة والـ LLMs
-# ==========================================
-from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_pinecone import PineconeVectorStore
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, CSVLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from audio_recorder_streamlit import audio_recorder
+    service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    service_account_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64", "")
 
-def get_llm():
-    provider = get_setting('llm_provider')
-    temp = float(get_setting('temperature', 0.2))
-    
-    if provider == 'Google Gemini':
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=get_setting('gemini_model', 'gemini-1.5-flash'), 
-                                      google_api_key=get_setting('google_api_key'), temperature=temp)
-    elif provider == 'Anthropic':
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=get_setting('anthropic_model', 'claude-3-haiku-20240307'), 
-                             api_key=get_setting('anthropic_api_key'), temperature=temp)
-    elif provider == 'Custom URL':
-        return ChatOpenAI(model=get_setting('custom_model', 'local-model'), 
-                          openai_api_base=get_setting('custom_base_url'), 
-                          openai_api_key=get_setting('custom_api_key', 'dummy'), temperature=temp)
-    else: # Default OpenAI
-        return ChatOpenAI(model=get_setting('llm_model', 'gpt-4o-mini'), 
-                          openai_api_key=get_setting('openai_api_key'), temperature=temp)
+    try:
+        if service_account_json:
+            info = json.loads(service_account_json)
+            cred = credentials.Certificate(info)
+        elif service_account_b64:
+            info = json.loads(base64.b64decode(service_account_b64).decode("utf-8"))
+            cred = credentials.Certificate(info)
+        elif os.path.exists("firebase-service-account.json"):
+            cred = credentials.Certificate("firebase-service-account.json")
+        else:
+            return None
 
-# ==========================================
-# 4. التصميم والواجهة (World-Class UI/UX)
-# ==========================================
-WORLD_CLASS_CSS = """
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Tajawal', sans-serif !important;
-        direction: rtl; text-align: right;
-    }
-    
-    .stApp {
-        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
-        color: #f8fafc;
-    }
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as exc:
+        st.error(f"Firebase init failed: {exc}")
+        return None
 
-    #MainMenu, footer, header {visibility: hidden;}
-    
-    [data-testid="stSidebar"] {
-        background-color: rgba(15, 23, 42, 0.7) !important;
-        backdrop-filter: blur(20px);
-        border-left: 1px solid rgba(255, 255, 255, 0.05);
-    }
-    
-    .glass-card {
-        background: rgba(30, 41, 59, 0.4);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 16px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
-    }
-    .glass-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-        border-color: rgba(139, 92, 246, 0.3);
-    }
-    
-    .metric-box {
-        text-align: center;
-        padding: 20px;
-        background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
-        border-radius: 12px;
-        border: 1px solid rgba(139, 92, 246, 0.2);
-    }
-    .metric-value { font-size: 2.5rem; font-weight: 800; color: #00f3ff; }
-    .metric-title { font-size: 1.1rem; color: #94a3b8; }
 
-    .stTextInput input, .stTextArea textarea, .stSelectbox select, .stNumberInput input {
-        background-color: rgba(15, 23, 42, 0.8) !important;
-        color: #e2e8f0 !important;
-        border: 1px solid #334155 !important;
-        border-radius: 10px !important;
-    }
-    .stTextInput input:focus, .stTextArea textarea:focus { border-color: #8b5cf6 !important; }
+def get_db():
+    return init_firebase()
 
-    .stButton > button {
-        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
-        color: white !important; border: none !important; border-radius: 10px !important;
-        font-weight: 700 !important; transition: all 0.3s !important; width: 100%;
-    }
-    .stButton > button:hover { transform: scale(1.02) !important; box-shadow: 0 8px 25px rgba(139, 92, 246, 0.5) !important; }
-    .btn-logout > button { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important; }
-    
-    .chat-bubble-user {
-        background: rgba(99, 102, 241, 0.15); border-radius: 15px 15px 0 15px;
-        padding: 15px; margin-bottom: 10px; border: 1px solid rgba(99, 102, 241, 0.3);
-    }
-    .chat-bubble-ai {
-        background: rgba(30, 41, 59, 0.6); border-radius: 15px 15px 15px 0;
-        padding: 15px; margin-bottom: 10px; border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-</style>
-"""
-st.markdown(WORLD_CLASS_CSS, unsafe_allow_html=True)
 
-# ==========================================
-# 5. دوال مساعدة للـ Audio و RAG
-# ==========================================
-def fallback_tts(text):
-    # محرك نطق مجاني (Web Speech API) متوافق مع المتصفحات
-    js = f"""
-    <script>
-        const text = `{text.replace('`', '').replace('"', '')}`;
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = "ar-EG";
-        utterance.rate = 0.9;
-        window.speechSynthesis.speak(utterance);
-    </script>
-    """
-    components.html(js, height=0, width=0)
+def bootstrap_admin_if_needed(db) -> None:
+    admin_user = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "admin")
+    admin_pass = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "admin123")
 
-def speak_text(text):
-    api_key = get_setting('openai_api_key')
-    if api_key and get_setting('use_openai_tts') == 'True':
-        try:
-            client = OpenAI(api_key=api_key)
-            response = client.audio.speech.create(
-                model="tts-1", voice=get_setting('tts_voice', 'onyx'), input=text
+    if not db:
+        return
+
+    try:
+        ref = db.collection(FIREBASE_COLLECTION_USERS).document(admin_user)
+        if not ref.get().exists:
+            ref.set(
+                {
+                    "username": admin_user,
+                    "password_hash": sha256_password(admin_pass),
+                    "role": "admin",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "active": True,
+                }
             )
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_mp3:
-                response.stream_to_file(tmp_mp3.name)
-                st.audio(tmp_mp3.name, format="audio/mp3", autoplay=True)
-        except Exception:
-            fallback_tts(text)
-    else:
-        fallback_tts(text)
+    except Exception:
+        pass
 
-def transcribe_audio(audio_bytes):
-    api_key = get_setting('openai_api_key')
-    if not api_key: return "تحويل الصوت لنص يتطلب OpenAI API Key."
-    client = OpenAI(api_key=api_key)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
-        tmp_audio.write(audio_bytes)
-        tmp_audio_path = tmp_audio.name
-    with open(tmp_audio_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file, language="ar")
-    os.unlink(tmp_audio_path)
-    return transcript.text
 
-def process_documents(uploaded_files):
-    os.environ['OPENAI_API_KEY'] = get_setting('openai_api_key')
-    pc = Pinecone(api_key=get_setting('pinecone_api_key'))
-    idx_name = get_setting('index_name')
-    if idx_name not in pc.list_indexes().names():
-        pc.create_index(name=idx_name, dimension=1536, metric='cosine', spec=ServerlessSpec(cloud='aws', region='us-east-1'))
-        while not pc.describe_index(idx_name).status['ready']: time.sleep(1)
-    
-    index = pc.Index(idx_name)
-    vector_store = PineconeVectorStore(index=index, embedding=OpenAIEmbeddings(), text_key="text")
-    all_docs = []
-    
-    for uf in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uf.name.split('.')[-1]}") as tmp:
-            tmp.write(uf.getvalue())
+def authenticate_user(username: str, password: str) -> Optional[Dict]:
+    db = get_db()
+
+    if not db:
+        fallback_user = os.getenv("LOCAL_ADMIN_USERNAME", "admin")
+        fallback_pass = os.getenv("LOCAL_ADMIN_PASSWORD", "admin123")
+        if username == fallback_user and password == fallback_pass:
+            return {"username": username, "role": "admin", "active": True}
+        return None
+
+    bootstrap_admin_if_needed(db)
+
+    try:
+        snap = db.collection(FIREBASE_COLLECTION_USERS).document(username).get()
+        if not snap.exists:
+            return None
+
+        user = snap.to_dict()
+        if not user.get("active", True):
+            return None
+
+        if user.get("password_hash") == sha256_password(password):
+            return user
+    except Exception as exc:
+        st.error(f"Authentication error: {exc}")
+
+    return None
+
+
+def create_or_update_user(username: str, password: str, role: str, active: bool = True) -> bool:
+    db = get_db()
+    if not db:
+        st.warning("Firebase غير متصل. لا يمكن حفظ المستخدمين إلا بعد تفعيل Firebase.")
+        return False
+
+    try:
+        payload = {
+            "username": username,
+            "role": role,
+            "active": active,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if password:
+            payload["password_hash"] = sha256_password(password)
+
+        ref = db.collection(FIREBASE_COLLECTION_USERS).document(username)
+        if not ref.get().exists:
+            payload["created_at"] = datetime.utcnow().isoformat()
+
+        ref.set(payload, merge=True)
+        return True
+    except Exception as exc:
+        st.error(f"User save failed: {exc}")
+        return False
+
+
+def list_users() -> List[Dict]:
+    db = get_db()
+    if not db:
+        return []
+
+    try:
+        docs = db.collection(FIREBASE_COLLECTION_USERS).stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception:
+        return []
+
+
+# =========================
+# Pinecone / LangChain
+# =========================
+
+def get_openai_client() -> Optional[OpenAI]:
+    if OpenAI is None:
+        st.error("OpenAI package غير مثبت.")
+        return None
+
+    key = st.session_state.openai_api_key
+    if not key:
+        st.warning("أدخل OpenAI API Key من الإعدادات.")
+        return None
+
+    return OpenAI(api_key=key)
+
+
+@st.cache_resource(show_spinner=False)
+def get_pinecone_client(api_key: str):
+    if Pinecone is None:
+        return None
+    if not api_key:
+        return None
+    return Pinecone(api_key=api_key)
+
+
+def ensure_pinecone_index() -> bool:
+    api_key = st.session_state.pinecone_api_key
+    index_name = st.session_state.pinecone_index
+
+    if not api_key:
+        st.warning("أدخل Pinecone API Key من الإعدادات.")
+        return False
+
+    pc = get_pinecone_client(api_key)
+    if pc is None:
+        st.error("Pinecone package غير مثبت.")
+        return False
+
+    try:
+        existing = [idx["name"] for idx in pc.list_indexes()]
+        if index_name not in existing:
+            pc.create_index(
+                name=index_name,
+                dimension=1536,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+            with st.spinner("جاري إنشاء Pinecone index..."):
+                time.sleep(8)
+        return True
+    except Exception as exc:
+        st.error(f"Pinecone index error: {exc}")
+        return False
+
+
+def get_vectorstore():
+    if not ensure_pinecone_index():
+        return None
+
+    if OpenAIEmbeddings is None or PineconeVectorStore is None:
+        st.error("LangChain packages غير مثبتة.")
+        return None
+
+    try:
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            api_key=st.session_state.openai_api_key,
+        )
+        return PineconeVectorStore(
+            index_name=st.session_state.pinecone_index,
+            embedding=embeddings,
+            namespace=st.session_state.pinecone_namespace,
+            pinecone_api_key=st.session_state.pinecone_api_key,
+        )
+    except Exception as exc:
+        st.error(f"VectorStore error: {exc}")
+        return None
+
+
+def extract_text_from_file(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+
+    if name.endswith(".txt"):
+        return raw.decode("utf-8", errors="ignore")
+
+    if name.endswith(".pdf"):
+        if PdfReader is None:
+            raise RuntimeError("pypdf غير مثبت.")
+        reader = PdfReader(io.BytesIO(raw))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return "\n".join(pages)
+
+    if name.endswith(".docx"):
+        if docx is None:
+            raise RuntimeError("python-docx غير مثبت.")
+        document = docx.Document(io.BytesIO(raw))
+        return "\n".join([p.text for p in document.paragraphs])
+
+    raise ValueError("صيغة غير مدعومة. استخدم PDF أو DOCX أو TXT.")
+
+
+def save_file_record(file_id: str, filename: str, chunks: int) -> None:
+    db = get_db()
+    if not db:
+        return
+
+    db.collection(FIREBASE_COLLECTION_FILES).document(file_id).set(
+        {
+            "file_id": file_id,
+            "filename": filename,
+            "chunks": chunks,
+            "namespace": st.session_state.pinecone_namespace,
+            "index": st.session_state.pinecone_index,
+            "uploaded_by": st.session_state.username,
+            "uploaded_at": datetime.utcnow().isoformat(),
+        }
+    )
+
+
+def list_file_records() -> List[Dict]:
+    db = get_db()
+    if not db:
+        return []
+
+    try:
+        docs = db.collection(FIREBASE_COLLECTION_FILES).stream()
+        return [doc.to_dict() for doc in docs]
+    except Exception:
+        return []
+
+
+def delete_file_record(file_id: str) -> None:
+    db = get_db()
+    if db:
+        db.collection(FIREBASE_COLLECTION_FILES).document(file_id).delete()
+
+
+def delete_file_vectors(file_id: str) -> bool:
+    api_key = st.session_state.pinecone_api_key
+    index_name = st.session_state.pinecone_index
+
+    try:
+        pc = get_pinecone_client(api_key)
+        index = pc.Index(index_name)
+        index.delete(
+            namespace=st.session_state.pinecone_namespace,
+            filter={"file_id": {"$eq": file_id}},
+        )
+        delete_file_record(file_id)
+        return True
+    except Exception as exc:
+        st.error(f"Delete failed: {exc}")
+        return False
+
+
+def process_file(uploaded_file) -> Optional[Dict]:
+    if RecursiveCharacterTextSplitter is None or Document is None:
+        st.error("LangChain text splitter غير مثبت.")
+        return None
+
+    vectorstore = get_vectorstore()
+    if not vectorstore:
+        return None
+
+    try:
+        text = extract_text_from_file(uploaded_file)
+        if not text.strip():
+            st.warning("الملف لا يحتوي على نص قابل للاستخراج.")
+            return None
+
+        file_id = str(uuid.uuid4())
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=180,
+            separators=["\n\n", "\n", ".", " ", ""],
+        )
+
+        chunks = splitter.split_text(text)
+        documents = [
+            Document(
+                page_content=chunk,
+                metadata={
+                    "file_id": file_id,
+                    "filename": uploaded_file.name,
+                    "chunk": i,
+                    "uploaded_at": datetime.utcnow().isoformat(),
+                },
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+
+        ids = [f"{file_id}-{i}" for i in range(len(documents))]
+        vectorstore.add_documents(documents=documents, ids=ids)
+        save_file_record(file_id, uploaded_file.name, len(documents))
+
+        return {"file_id": file_id, "filename": uploaded_file.name, "chunks": len(documents)}
+    except Exception as exc:
+        st.error(f"File processing failed: {exc}")
+        return None
+
+
+# =========================
+# Audio + RAG Chat
+# =========================
+
+def transcribe_audio(audio_bytes: bytes) -> Optional[str]:
+    client = get_openai_client()
+    if not client:
+        return None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
             tmp_path = tmp.name
-        
-        loader = None
-        if uf.name.endswith('.pdf'): loader = PyPDFLoader(tmp_path)
-        elif uf.name.endswith('.txt'): loader = TextLoader(tmp_path, encoding='utf-8')
-        elif uf.name.endswith('.docx'): loader = Docx2txtLoader(tmp_path)
-        
-        if loader:
-            docs = loader.load()
-            splitter = RecursiveCharacterTextSplitter(chunk_size=int(get_setting('chunk_size', 1000)), chunk_overlap=int(get_setting('chunk_overlap', 150)))
-            all_docs.extend(splitter.split_documents(docs))
-        os.unlink(tmp_path)
-        
-    if all_docs:
-        vector_store.add_documents(all_docs)
-        return len(all_docs)
-    return 0
 
-# ==========================================
-# 6. واجهات المستخدم (Views)
-# ==========================================
-if 'user_id' not in st.session_state:
-    st.session_state.update({'logged_in': False, 'role': None, 'user_id': None, 'username': None, 'current_session': None})
+        with open(tmp_path, "rb") as audio_file:
+            result = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language="ar",
+            )
 
-def render_login():
-    st.markdown("<br><br><br>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 1.2, 1])
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+        return result.text
+    except Exception as exc:
+        st.error(f"Whisper transcription failed: {exc}")
+        return None
+
+
+def retrieve_context(question: str, k: int = 5) -> Tuple[str, List[Dict]]:
+    vectorstore = get_vectorstore()
+    if not vectorstore:
+        return "", []
+
+    try:
+        docs = vectorstore.similarity_search(question, k=k)
+        context = "\n\n".join(
+            [f"[Source: {doc.metadata.get('filename', 'unknown')}]\n{doc.page_content}" for doc in docs]
+        )
+        sources = [doc.metadata for doc in docs]
+        return context, sources
+    except Exception as exc:
+        st.error(f"Retrieval failed: {exc}")
+        return "", []
+
+
+def generate_answer(question: str, context: str) -> str:
+    if ChatOpenAI is None or ChatPromptTemplate is None:
+        return "LangChain ChatOpenAI غير مثبت."
+
+    try:
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.35,
+            api_key=st.session_state.openai_api_key,
+        )
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """
+أنت "الأسطى كبير": خبير صيانة صناعية مصري مخضرم.
+أسلوبك عامي مصري محترم، عملي، مختصر، وواثق.
+اشرح للعامل الخطوات بوضوح وبالترتيب.
+لو في خطر كهربا، ضغط، حرارة، مواد كيماوية، أو ماكينة دوارة، ابدأ بتحذير أمان واضح.
+اعتمد فقط على السياق الصناعي المرفق. لو المعلومة ناقصة قل إنك محتاج كتالوج أو قراءة إضافية.
+لا تخترع أرقام عزم أو ضغط أو حرارة غير موجودة في السياق.
+                    """,
+                ),
+                (
+                    "human",
+                    """
+السياق من قاعدة المعرفة:
+{context}
+
+مشكلة العامل:
+{question}
+
+اكتب الرد بصوت الأسطى كبير:
+                    """,
+                ),
+            ]
+        )
+
+        chain = prompt | llm
+        response = chain.invoke({"context": context, "question": question})
+        return response.content
+    except Exception as exc:
+        return f"LLM failed: {exc}"
+
+
+def elevenlabs_tts(text: str) -> Optional[bytes]:
+    api_key = st.session_state.elevenlabs_api_key
+    voice_id = st.session_state.elevenlabs_voice_id
+
+    if not api_key or not voice_id or requests is None:
+        return None
+
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.55,
+                "similarity_boost": 0.75,
+                "style": 0.35,
+                "use_speaker_boost": True,
+            },
+        }
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        if res.status_code == 200:
+            return res.content
+    except Exception:
+        return None
+
+    return None
+
+
+def gtts_tts(text: str) -> Optional[bytes]:
+    if gTTS is None:
+        return None
+
+    try:
+        audio_io = io.BytesIO()
+        tts = gTTS(text=text, lang="ar", slow=False)
+        tts.write_to_fp(audio_io)
+        audio_io.seek(0)
+        return audio_io.read()
+    except Exception as exc:
+        st.warning(f"gTTS failed: {exc}")
+        return None
+
+
+def text_to_speech(text: str) -> Optional[bytes]:
+    audio = elevenlabs_tts(text)
+    if audio:
+        return audio
+    return gtts_tts(text)
+
+
+def chat_interface() -> None:
+    st.markdown('<div class="main-title">Voice-First RAG</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">سجل العطل بصوتك، والنظام يسترجع المعرفة الصناعية ويرد عليك بأسلوب الأسطى كبير.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([1.05, 1])
+
+    with col1:
+        st.subheader("تسجيل المشكلة")
+        typed_question = st.text_area(
+            "اكتب المشكلة لو التسجيل غير متاح",
+            placeholder="مثال: الموتور بيسخن بعد 10 دقايق تشغيل وفيه صوت عالي من ناحية البلية...",
+            height=130,
+        )
+
+        audio_bytes = None
+        if audio_recorder:
+            audio_bytes = audio_recorder(
+                text="اضغط وسجل المشكلة",
+                recording_color="#ff4fd8",
+                neutral_color="#21f7ff",
+                icon_name="microphone",
+                icon_size="2x",
+            )
+        else:
+            st.warning("audio_recorder_streamlit غير مثبت. استخدم الكتابة مؤقتاً.")
+
+        ask = st.button("اسأل الأسطى كبير", use_container_width=True)
+
     with col2:
-        st.markdown("""<div class="glass-card" style="text-align: center;">
-            <h1 style="color: #8b5cf6;">OSTA AI Enterprise</h1>
-            <p style="color: #94a3b8;">منصة التحليل والصيانة المعتمدة على الذكاء الاصطناعي</p>
-            <hr style="border-color: rgba(255,255,255,0.1);"></div>""", unsafe_allow_html=True)
-        
-        user = st.text_input("👤 اسم المستخدم")
-        pwd = st.text_input("🔒 كلمة المرور", type="password")
-        if st.button("تسجيل الدخول 🚀"):
-            c = conn.cursor()
-            c.execute("SELECT id, role FROM users WHERE username=? AND password=?", (user, hashlib.sha256(pwd.encode()).hexdigest()))
-            res = c.fetchone()
-            if res:
-                st.session_state.update({'logged_in': True, 'user_id': res[0], 'role': res[1], 'username': user})
-                st.rerun()
-            else:
-                st.error("❌ بيانات الدخول غير صحيحة.")
+        st.subheader("حالة النظام")
+        st.markdown(
+            f"""
+            <span class="metric-chip">Index: {st.session_state.pinecone_index}</span>
+            <span class="metric-chip">Namespace: {st.session_state.pinecone_namespace}</span>
+            <span class="metric-chip">User: {st.session_state.username}</span>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("تأكد أن ملفات المعرفة مرفوعة من لوحة المدير قبل السؤال.")
 
-def render_admin_dashboard():
-    with st.sidebar:
-        st.markdown(f"### 👋 أهلاً، {st.session_state['username']}")
-        menu = st.radio("القائمة:", ["📊 لوحة التحكم والإحصائيات", "👥 إدارة المستخدمين (Tenants)", "⚙️ الإعدادات والـ APIs", "📚 محرك المعرفة (RAG)"])
-        st.markdown("<div class='btn-logout'>", unsafe_allow_html=True)
-        if st.button("🚪 تسجيل الخروج"):
-            st.session_state.clear()
-            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if ask:
+        question = typed_question.strip()
+
+        if audio_bytes:
+            with st.spinner("بفك التسجيل وبحوله لنص..."):
+                transcribed = transcribe_audio(audio_bytes)
+                if transcribed:
+                    question = transcribed
+                    st.info(f"النص المستخرج: {question}")
+
+        if not question:
+            st.warning("اكتب المشكلة أو سجلها صوتياً أولاً.")
+            return
+
+        with st.spinner("بفتش في قاعدة المعرفة الصناعية..."):
+            context, sources = retrieve_context(question)
+
+        with st.spinner("الأسطى كبير بيجهز الرد..."):
+            answer = generate_answer(question, context)
+
+        st.session_state.chat_history.append(
+            {
+                "question": question,
+                "answer": answer,
+                "sources": sources,
+                "time": datetime.now().strftime("%H:%M:%S"),
+            }
+        )
+
+        with st.spinner("بحول الرد لصوت..."):
+            audio_reply = text_to_speech(answer)
+
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.subheader("رد الأسطى كبير")
+        st.markdown(f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True)
+
+        if audio_reply:
+            st.audio(audio_reply, format="audio/mp3")
+
+        if sources:
+            source_names = sorted(set([s.get("filename", "unknown") for s in sources]))
+            st.markdown(
+                f'<div class="source-box">المصادر: {", ".join(source_names)}</div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    if menu == "📊 لوحة التحكم والإحصائيات":
-        st.markdown("<h2>📊 نظرة عامة على النظام</h2>", unsafe_allow_html=True)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users WHERE role='Worker'")
-        workers_count = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM messages")
-        msgs_count = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM alerts")
-        alerts_count = c.fetchone()[0]
-        
-        col1, col2, col3 = st.columns(3)
-        with col1: st.markdown(f"<div class='metric-box'><div class='metric-value'>{workers_count}</div><div class='metric-title'>العمال المسجلين</div></div>", unsafe_allow_html=True)
-        with col2: st.markdown(f"<div class='metric-box'><div class='metric-value'>{msgs_count}</div><div class='metric-title'>إجمالي الرسائل</div></div>", unsafe_allow_html=True)
-        with col3: st.markdown(f"<div class='metric-box'><div class='metric-value'>{alerts_count}</div><div class='metric-title'>تنبيهات الأعطال التلقائية</div></div>", unsafe_allow_html=True)
-        
-        st.markdown("<br><h3>🚨 أحدث تنبيهات النظام (Cron Alerts)</h3>", unsafe_allow_html=True)
-        c.execute("SELECT title, content, timestamp FROM alerts ORDER BY timestamp DESC LIMIT 5")
-        alerts = c.fetchall()
-        for a in alerts:
-            st.error(f"**{a[2]} | {a[0]}**\n\n{a[1]}")
-            
-    elif menu == "👥 إدارة المستخدمين (Tenants)":
-        st.markdown("<h2>👥 إدارة فرق العمل</h2>", unsafe_allow_html=True)
-        with st.form("add_user"):
-            nu = st.text_input("اسم المستخدم الجديد")
-            np = st.text_input("كلمة المرور", type="password")
-            nr = st.selectbox("الصلاحية", ["Worker", "Manager"])
-            if st.form_submit_button("إضافة مستخدم"):
-                try:
-                    c = conn.cursor()
-                    c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (nu, hashlib.sha256(np.encode()).hexdigest(), nr))
-                    conn.commit()
-                    st.success("تم الإضافة بنجاح!")
-                except sqlite3.IntegrityError:
-                    st.error("اسم المستخدم موجود بالفعل.")
-        
-        st.markdown("### المستخدمين الحاليين")
-        c = conn.cursor()
-        users = c.execute("SELECT id, username, role FROM users").fetchall()
-        for u in users:
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"🆔 **{u[1]}** ({u[2]})")
-            if u[1] != 'admin' and col2.button("حذف", key=f"del_{u[0]}"):
-                c.execute("DELETE FROM users WHERE id=?", (u[0],))
-                conn.commit()
-                st.rerun()
+    if st.session_state.chat_history:
+        st.subheader("آخر المحادثات")
+        for item in reversed(st.session_state.chat_history[-5:]):
+            with st.expander(f"{item['time']} - {item['question'][:70]}"):
+                st.write(item["answer"])
 
-    elif menu == "⚙️ الإعدادات والـ APIs":
-        st.markdown("<h2>⚙️ إعدادات الذكاء الاصطناعي</h2>", unsafe_allow_html=True)
-        t1, t2 = st.tabs(["مقدمي الخدمة (Providers)", "شخصية الأسطى و TTS"])
-        with t1:
-            provider = st.selectbox("المحرك الأساسي (LLM Provider)", ["OpenAI", "Google Gemini", "Anthropic", "Custom URL"], index=["OpenAI", "Google Gemini", "Anthropic", "Custom URL"].index(get_setting('llm_provider', 'OpenAI')))
-            set_setting('llm_provider', provider)
-            
-            if provider == "OpenAI":
-                set_setting('openai_api_key', st.text_input("OpenAI API Key", get_setting('openai_api_key'), type="password"))
-                set_setting('llm_model', st.selectbox("Model", ["gpt-4o", "gpt-4o-mini"], index=0 if get_setting('llm_model')=='gpt-4o' else 1))
-            elif provider == "Google Gemini":
-                set_setting('google_api_key', st.text_input("Google API Key", get_setting('google_api_key'), type="password"))
-                set_setting('gemini_model', st.text_input("Model Name", get_setting('gemini_model', 'gemini-1.5-flash')))
-            elif provider == "Anthropic":
-                set_setting('anthropic_api_key', st.text_input("Anthropic API Key", get_setting('anthropic_api_key'), type="password"))
-                set_setting('anthropic_model', st.text_input("Model Name", get_setting('anthropic_model', 'claude-3-haiku-20240307')))
-            elif provider == "Custom URL":
-                set_setting('custom_base_url', st.text_input("Base URL", get_setting('custom_base_url', 'http://localhost:11434/v1')))
-                set_setting('custom_api_key', st.text_input("API Key (Optional)", get_setting('custom_api_key', 'dummy'), type="password"))
-                set_setting('custom_model', st.text_input("Model Name", get_setting('custom_model', 'llama3')))
-                
-            set_setting('pinecone_api_key', st.text_input("Pinecone API Key (For RAG)", get_setting('pinecone_api_key'), type="password"))
-            set_setting('temperature', st.slider("Temperature", 0.0, 1.0, float(get_setting('temperature', 0.2))))
-            
-        with t2:
-            set_setting('system_prompt', st.text_area("System Prompt", get_setting('system_prompt'), height=150))
-            set_setting('use_openai_tts', st.checkbox("استخدام OpenAI للصوت (إن وجد، وإلا سيستخدم المجاني)", value=(get_setting('use_openai_tts', 'True')=='True')))
-            set_setting('tts_voice', st.selectbox("نبرة الصوت", ["onyx", "echo", "alloy"], index=0))
 
-    elif menu == "📚 محرك المعرفة (RAG)":
-        st.markdown("<h2>📚 إدارة الداتا وتدريب المحرك</h2>", unsafe_allow_html=True)
-        set_setting('index_name', st.text_input("Pinecone Index Name", get_setting('index_name')))
-        col1, col2 = st.columns(2)
-        set_setting('chunk_size', col1.number_input("Chunk Size", value=int(get_setting('chunk_size', 1000))))
-        set_setting('k_results', col2.number_input("K-Results", value=int(get_setting('k_results', 4))))
-        
-        uf = st.file_uploader("ارفع الملفات", accept_multiple_files=True)
-        if st.button("معالجة ورفع لـ Pinecone"):
-            if uf and get_setting('pinecone_api_key'):
-                with st.spinner("جاري المعالجة..."):
-                    cnt = process_documents(uf)
-                    st.success(f"تم رفع {cnt} مقطع!")
-            else:
-                st.error("تأكد من إرفاق ملفات وإدخال مفتاح Pinecone.")
+# =========================
+# Admin Panel
+# =========================
 
-def render_worker_chat():
-    c = conn.cursor()
-    uid = st.session_state['user_id']
-    
-    # إدارة الجلسات في الشريط الجانبي
-    with st.sidebar:
-        st.markdown("### 🗂️ سجل المحادثات")
-        if st.button("➕ محادثة جديدة"):
-            c.execute("INSERT INTO chat_sessions (user_id, title, created_at) VALUES (?, ?, datetime('now'))", (uid, "استشارة جديدة"))
-            conn.commit()
-            st.session_state['current_session'] = c.lastrowid
-            st.rerun()
-            
-        sessions = c.execute("SELECT id, title FROM chat_sessions WHERE user_id=? ORDER BY created_at DESC", (uid,)).fetchall()
-        if not sessions:
-            st.info("لا توجد محادثات سابقة.")
-            
-        for sid, title in sessions:
-            col1, col2 = st.columns([4, 1])
-            if col1.button(f"💬 {title}", key=f"sess_{sid}"):
-                st.session_state['current_session'] = sid
-                st.rerun()
-            if col2.button("🗑️", key=f"del_{sid}"):
-                c.execute("DELETE FROM chat_sessions WHERE id=?", (sid,))
-                c.execute("DELETE FROM messages WHERE session_id=?", (sid,))
-                conn.commit()
-                if st.session_state['current_session'] == sid: st.session_state['current_session'] = None
-                st.rerun()
-                
-        st.markdown("<div class='btn-logout'>", unsafe_allow_html=True)
-        if st.button("تسجيل خروج"):
-            st.session_state.clear()
-            st.rerun()
+def settings_panel() -> None:
+    st.markdown('<div class="main-title">Settings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">إدارة مفاتيح التشغيل والاتصال بالخدمات الخارجية.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+
+    st.session_state.openai_api_key = st.text_input(
+        "OpenAI API Key",
+        value=st.session_state.openai_api_key,
+        type="password",
+    )
+    st.session_state.pinecone_api_key = st.text_input(
+        "Pinecone API Key",
+        value=st.session_state.pinecone_api_key,
+        type="password",
+    )
+    st.session_state.pinecone_index = st.text_input(
+        "Pinecone Index",
+        value=st.session_state.pinecone_index,
+    )
+    st.session_state.pinecone_namespace = st.text_input(
+        "Pinecone Namespace",
+        value=st.session_state.pinecone_namespace,
+    )
+    st.session_state.elevenlabs_api_key = st.text_input(
+        "ElevenLabs API Key اختياري",
+        value=st.session_state.elevenlabs_api_key,
+        type="password",
+    )
+    st.session_state.elevenlabs_voice_id = st.text_input(
+        "ElevenLabs Voice ID اختياري",
+        value=st.session_state.elevenlabs_voice_id,
+    )
+
+    if st.button("اختبار Pinecone / إنشاء Index", use_container_width=True):
+        if ensure_pinecone_index():
+            st.success("Pinecone جاهز.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def data_upload_panel() -> None:
+    st.markdown('<div class="main-title">Knowledge Upload</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">ارفع كتالوجات، إجراءات صيانة، تقارير أعطال، وملفات تشغيل.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        "ملفات المعرفة الصناعية",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True,
+    )
+
+    if st.button("معالجة وتخزين الملفات", use_container_width=True):
+        if not uploaded_files:
+            st.warning("اختر ملف واحد على الأقل.")
+        else:
+            for file in uploaded_files:
+                with st.spinner(f"جاري معالجة {file.name}..."):
+                    result = process_file(file)
+                if result:
+                    st.success(f"تم تخزين {result['filename']} بعدد {result['chunks']} chunks.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.subheader("إدارة الملفات")
+    records = list_file_records()
+
+    if not records:
+        st.info("لا توجد ملفات مسجلة في Firebase حتى الآن.")
+        return
+
+    for rec in records:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 1, 1])
+
+        with col1:
+            st.write(f"**{rec.get('filename', 'unknown')}**")
+            st.caption(f"File ID: {rec.get('file_id')} | Chunks: {rec.get('chunks')}")
+
+        with col2:
+            st.caption(rec.get("uploaded_at", ""))
+
+        with col3:
+            if st.button("حذف", key=f"delete-{rec.get('file_id')}", use_container_width=True):
+                if delete_file_vectors(rec.get("file_id")):
+                    st.success("تم حذف الملف من Pinecone و Firebase.")
+                    st.rerun()
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # إنشاء جلسة افتراضية إذا لم تكن موجودة
-    if not st.session_state['current_session']:
-        if sessions:
-            st.session_state['current_session'] = sessions[0][0]
+
+def users_panel() -> None:
+    st.markdown('<div class="main-title">Users</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">إدارة دخول العمال والمديرين عبر Firebase Admin.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        role = st.selectbox("Role", ["worker", "admin"])
+        active = st.toggle("Active", value=True)
+
+        if st.button("حفظ المستخدم", use_container_width=True):
+            if not username:
+                st.warning("اكتب username.")
+            elif create_or_update_user(username, password, role, active):
+                st.success("تم حفظ المستخدم.")
+
+    with col2:
+        st.write("المستخدمون الحاليون")
+        users = list_users()
+        if users:
+            for user in users:
+                st.markdown(
+                    f"""
+                    <div class="neon-card">
+                        <b>{user.get("username")}</b><br/>
+                        Role: {user.get("role")}<br/>
+                        Active: {user.get("active", True)}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
         else:
-            c.execute("INSERT INTO chat_sessions (user_id, title, created_at) VALUES (?, ?, datetime('now'))", (uid, "استشارة جديدة"))
-            conn.commit()
-            st.session_state['current_session'] = c.lastrowid
+            st.info("Firebase غير متصل أو لا توجد بيانات.")
 
-    sid = st.session_state['current_session']
-    
-    # عرض الرسائل السابقة
-    st.markdown("<h2>🛠️ ورشة الأسطى للذكاء الاصطناعي</h2>", unsafe_allow_html=True)
-    msgs = c.execute("SELECT role, content, image_b64 FROM messages WHERE session_id=? ORDER BY timestamp ASC", (sid,)).fetchall()
-    
-    for role, content, img_b64 in msgs:
-        if role == 'user':
-            with st.chat_message("user"):
-                st.write(content)
-                if img_b64: st.image(base64.b64decode(img_b64))
-        else:
-            with st.chat_message("assistant"):
-                st.write(content)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # أدوات الإدخال (صوت، صورة، نص)
-    st.markdown("---")
-    col_mic, col_cam, col_txt = st.columns([1, 1, 3])
-    
-    audio_bytes = None
-    with col_mic: audio_bytes = audio_recorder("🔴 سجل صوت", icon_size="2x")
-    with col_cam: img_file = st.camera_input("📸 صور العطل", label_visibility="collapsed")
-    
-    user_text = st.chat_input("أو اكتب مشكلتك هنا...")
-    
-    prompt = user_text
-    if audio_bytes and get_setting('openai_api_key'):
-        with st.spinner("جاري تفريغ الصوت..."): prompt = transcribe_audio(audio_bytes)
-        
-    if prompt or img_file:
-        img_b64 = base64.b64encode(img_file.getvalue()).decode() if img_file else None
-        
-        # حفظ وعرض رسالة المستخدم
-        with st.chat_message("user"):
-            st.write(prompt)
-            if img_file: st.image(img_file)
-            
-        db.collection('messages').add({
-            'session_id': sid, 
-            'role': 'user', 
-            'content': prompt, 
-            'image_b64': img_b64, 
-            'timestamp': datetime.now()
-        })
-        
-        # جلب السياق من Pinecone
-        context = ""
-        if get_setting('pinecone_api_key'):
-            try:
-                os.environ['OPENAI_API_KEY'] = get_setting('openai_api_key')
-                pc = Pinecone(api_key=get_setting('pinecone_api_key'))
-                idx = pc.Index(get_setting('index_name'))
-                vs = PineconeVectorStore(index=idx, embedding=OpenAIEmbeddings(), text_key="text")
-                docs = vs.similarity_search(prompt, k=int(get_setting('k_results', 4)))
-                context = "\n\n".join([d.page_content for d in docs])
-            except: pass
 
-        # تجهيز الرسالة للمحرك
-        sys_msg = get_setting('system_prompt')
-        full_prompt = f"المعلومات المرفقة:\n{context}\n\nسؤال العامل: {prompt}"
-        
-        lc_msgs = [{"role": "system", "content": sys_msg}]
-        if img_b64:
-            lc_msgs.append({"role": "user", "content": [{"type": "text", "text": full_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]})
-        else:
-            lc_msgs.append({"role": "user", "content": full_prompt})
+def admin_panel() -> None:
+    page = st.sidebar.radio(
+        "Admin Navigation",
+        ["الشات", "رفع البيانات", "الإعدادات", "المستخدمون"],
+    )
 
-        # توليد الرد بشكل حي (Streaming)
-        with st.chat_message("assistant"):
-            try:
-                llm = get_llm()
-                # st.write_stream يعرض الكلمات تباعاً
-                answer = st.write_stream(llm.stream(lc_msgs)) 
-                
-                db.collection('messages').add({
-                    'session_id': sid, 
-                    'role': 'assistant', 
-                    'content': answer, 
-                    'timestamp': datetime.now()
-                })
-                
-                # نطق الرد
-                speak_text(answer)
-                
-            except Exception as e:
-                st.error(f"خطأ في محرك الذكاء الاصطناعي: {e}")
+    if page == "الشات":
+        chat_interface()
+    elif page == "رفع البيانات":
+        data_upload_panel()
+    elif page == "الإعدادات":
+        settings_panel()
+    elif page == "المستخدمون":
+        users_panel()
 
-def main():
-    if not st.session_state['logged_in']:
-        render_login()
+
+def worker_panel() -> None:
+    page = st.sidebar.radio("Worker Navigation", ["الشات", "الإعدادات"])
+    if page == "الشات":
+        chat_interface()
     else:
-        if st.session_state['role'] == "Manager":
-            render_admin_dashboard()
-        elif st.session_state['role'] == "Worker":
-            render_worker_chat()
+        settings_panel()
+
+
+# =========================
+# Login UI
+# =========================
+
+def login_screen() -> None:
+    st.markdown('<div class="main-title">Industrial Knowledge RAG</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">منصة معرفة صناعية صوتية للورش والمصانع: اسأل عن العطل، واستقبل رد عملي من قاعدة معرفة المصنع.</div>',
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1.05, 0.95])
+
+    with left:
+        st.markdown(
+            """
+            <div class="glass-card">
+                <div class="role-pill">Factory Intelligence</div>
+                <h3>نظام واحد للعمال والمديرين</h3>
+                <p style="color:#9fb3c8">
+                    المدير يرفع ملفات المعرفة ويدير المستخدمين. العامل يسجل المشكلة بصوته ويحصل على إجابة عملية مبنية على مستندات المصنع.
+                </p>
+                <span class="metric-chip">Voice RAG</span>
+                <span class="metric-chip">Pinecone</span>
+                <span class="metric-chip">Firebase</span>
+                <span class="metric-chip">Glass UI</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with right:
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.subheader("تسجيل الدخول")
+
+        username = st.text_input("اسم المستخدم")
+        password = st.text_input("كلمة المرور", type="password")
+
+        if st.button("دخول", use_container_width=True):
+            user = authenticate_user(username, password)
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.user_id = username
+                st.session_state.username = user.get("username", username)
+                st.session_state.role = user.get("role", "worker")
+                st.success("تم تسجيل الدخول.")
+                st.rerun()
+            else:
+                st.error("بيانات الدخول غير صحيحة.")
+
+        st.caption("Fallback محلي عند عدم اتصال Firebase: admin / admin123")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================
+# Main
+# =========================
+
+def app_shell() -> None:
+    st.sidebar.markdown("## Industrial RAG")
+    st.sidebar.markdown(
+        f"""
+        <div class="neon-card">
+            <b>{st.session_state.username}</b><br/>
+            Role: {st.session_state.role}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.sidebar.button("تسجيل خروج", use_container_width=True):
+        for key in ["logged_in", "user_id", "username", "role"]:
+            st.session_state[key] = False if key == "logged_in" else None
+        st.rerun()
+
+    if st.session_state.role == "admin":
+        admin_panel()
+    else:
+        worker_panel()
+
+
+def main() -> None:
+    inject_css()
+    init_state()
+
+    db = get_db()
+    if db:
+        bootstrap_admin_if_needed(db)
+
+    if not st.session_state.logged_in:
+        login_screen()
+    else:
+        app_shell()
+
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
