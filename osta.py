@@ -493,8 +493,14 @@ def render_worker_chat():
         with st.chat_message("user"):
             st.write(prompt)
             if img_file: st.image(img_file)
-        c.execute("INSERT INTO messages (session_id, role, content, image_b64, timestamp) VALUES (?, ?, ?, ?, datetime('now'))", (sid, 'user', prompt, img_b64))
-        conn.commit()
+            
+        db.collection('messages').add({
+            'session_id': sid, 
+            'role': 'user', 
+            'content': prompt, 
+            'image_b64': img_b64, 
+            'timestamp': datetime.now()
+        })
         
         # جلب السياق من Pinecone
         context = ""
@@ -525,8 +531,12 @@ def render_worker_chat():
                 # st.write_stream يعرض الكلمات تباعاً
                 answer = st.write_stream(llm.stream(lc_msgs)) 
                 
-                c.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, datetime('now'))", (sid, 'assistant', answer))
-                conn.commit()
+                db.collection('messages').add({
+                    'session_id': sid, 
+                    'role': 'assistant', 
+                    'content': answer, 
+                    'timestamp': datetime.now()
+                })
                 
                 # نطق الرد
                 speak_text(answer)
