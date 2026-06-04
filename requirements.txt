@@ -4,6 +4,7 @@ langchain
 langchain-openai
 langchain-pinecone
 langchain-community
+langchain-text-splitters
 openai
 audio-recorder-streamlit
 pypdf
