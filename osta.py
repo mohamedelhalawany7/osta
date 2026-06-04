@@ -2190,264 +2190,258 @@ async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSessi
 # =====================================================================
 # واجهة Streamlit السحرية (تم دمج واجهة الكشك الأصلية هنا بالكامل)
 # =====================================================================
-if __name__ == "__main__":
-    st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
 
-    def is_server_running(port=8000):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(('127.0.0.1', port)) == 0
+def is_server_running(port=8000):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('127.0.0.1', port)) == 0
 
-    if "server_started" not in st.session_state:
-        if not is_server_running():
-            def run_server():
-                try:
-                    # 1. إنشاء Event Loop مستقل تماماً للخيط الفرعي لتجنب تجميد (Block) واجهة Streamlit
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
-                    # 2. تمرير loop="asyncio" لمنع uvicorn من محاولة إنشاء loop متضارب
-                    config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning", loop="asyncio")
-                    server = uvicorn.Server(config)
-                    
-                    # 3. منع uvicorn من التقاط إشارات النظام (SIGINT/SIGTERM) لعدم إيقاف Streamlit
-                    server.install_signal_handlers = lambda: None
-                    
-                    # 4. تشغيل الخادم بشكل آمن ومستقل داخل الـ Loop المعزول
-                    loop.run_until_complete(server.serve())
-                except Exception as e:
-                    logger.error(f"Failed to start backend server: {e}")
-
-            with st.spinner("🚀 جاري تهيئة بيئة العمل الأساسية..."):
-                t = threading.Thread(target=run_server, daemon=True)
-                t.start()
-                # ❌ تم الحذف الجراحي لحلقة (time.sleep) التي كانت تسبب تجميد السيرفر و Connection Refused
-        st.session_state.server_started = True
-
-    API_BASE = "http://127.0.0.1:8000"
-    
-    # تنسيقات الواجهة لتشبه واجهة الكشك الأصلية
-    st.markdown("""
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
-        html, body, [class*="css"] { font-family: 'Cairo', sans-serif; direction: rtl; text-align: right; }
-        .stChatMessage { border-radius: 15px !important; padding: 15px !important; margin-bottom: 15px !important; font-size: 1.1rem; }
-        div[data-testid="stChatMessage"]:nth-child(even) { background-color: rgba(255, 152, 0, 0.1); border-right: 4px solid #FF9800; }
-        div[data-testid="stChatMessage"]:nth-child(odd) { background-color: rgba(30, 30, 30, 0.8); border-right: 4px solid #2196F3; }
-        /* إخفاء الهيدر الافتراضي لإعطاء شكل التطبيق المستقل */
-        header {visibility: hidden;}
-        #MainMenu {visibility: hidden;}
-    </style>
-    """, unsafe_allow_html=True)
-    
-    def login(username, password):
-        try:
-            response = requests.post(f"{API_BASE}/api/streamlit_login", json={"username": username, "password": password})
-            if response.status_code == 200: return response.json()
-        except Exception as e:
-            st.error(f"خطأ في الاتصال بالسيرفر: {e}")
-        return None
-
-    if "token" not in st.session_state: st.session_state.token = None
-    if "user" not in st.session_state: st.session_state.user = None
-
-    if not st.session_state.token:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.markdown("<h2 style='text-align: center; color: #FF9800;'><br>🔧 دخول الورشة</h2>", unsafe_allow_html=True)
-            username = st.text_input("اسم المستخدم", placeholder="worker أو admin")
-            password = st.text_input("كلمة السر", type="password")
-            if st.button("دخول المساعد 🚀", use_container_width=True):
-                if username and password:
-                    result = login(username, password)
-                    if result:
-                        st.session_state.token = result["access_token"]
-                        st.session_state.user = result["user"]
-                        st.rerun()
-                    else:
-                        st.error("❌ بيانات خطأ، جرب تاني يا هندسة")
-                else:
-                    st.warning("⚠️ أدخل اسم المستخدم وكلمة السر")
-    else:
-        user = st.session_state.user
-        headers = {"Authorization": f"Bearer {st.session_state.token}"}
-        
-        with st.sidebar:
-            st.markdown(f"### 👷 أهلاً يا هندسة: <span style='color:#FF9800;'>{user['username']}</span>", unsafe_allow_html=True)
-            st.markdown("---")
-            if user["role"] == "admin":
-                page = st.radio("القائمة الرئيسية", ["💬 واجهة العمال (Kiosk)", "🔥 مراقبة Firebase", "⚙️ إعدادات النظام"])
-            else:
-                page = "💬 واجهة العمال (Kiosk)"
-                st.info("أنت مسجل كـ 'عامل'. لديك صلاحية المحادثة فقط.")
-                
-            st.markdown("---")
-            if st.button("🚪 تسجيل خروج", use_container_width=True):
-                st.session_state.token = None
-                st.session_state.user = None
-                if "messages" in st.session_state: st.session_state.messages = []
-                st.rerun()
-
-        if page == "💬 واجهة العمال (Kiosk)":
-            st.markdown("## 🎙️ مساعد الورشة الذكي (الأسطى)")
-            st.caption("الأسطى معاك، اكتب مشكلتك أو ارفع صورة العطل أو سجل صوتك بالضغط على (إرفاق وسائط).")
-            
-            if "messages" not in st.session_state: st.session_state.messages = []
-            
-            # عرض الرسائل السابقة مع الوسائط
-            for msg in st.session_state.messages:
-                with st.chat_message(msg["role"]):
-                    st.write(msg["content"])
-                    if "audio" in msg and msg["audio"]:
-                        st.audio(msg["audio"])
-                    if "image" in msg and msg["image"]:
-                        st.image(msg["image"], width=300)
-
-            # منطقة الإدخال الذكية
-            prompt = st.chat_input("اكتب سؤالك للأسطى هنا...")
-            
-            with st.expander("📸 إرفاق وسائط (صورة أو تسجيل صوتي)", expanded=False):
-                with st.form("media_form", clear_on_submit=True):
-                    st.info("💡 ملاحظة: يجب إعطاء المتصفح صلاحية استخدام الميكروفون والكاميرا.")
-                    c1, c2 = st.columns(2)
-                    with c1: audio_val = st.audio_input("🎙️ سجل سؤالك")
-                    with c2: cam_val = st.camera_input("📸 صور العطل")
-                    text_val = st.text_input("💬 تعليق إضافي مع الصورة/الصوت (اختياري)")
-                    submit_media = st.form_submit_button("إرسال الوسائط للأسطى 🚀", use_container_width=True)
-
-            # منطق المعالجة الشامل لدمج الواجهة القديمة
-            trigger = False
-            final_text = ""
-            final_audio = None
-            final_cam = None
-
-            if prompt:
-                trigger = True
-                final_text = prompt
-            elif submit_media and (audio_val or cam_val or text_val):
-                trigger = True
-                final_text = text_val
-                final_audio = audio_val
-                final_cam = cam_val
-
-            if trigger:
-                # تحضير وتشفير البيانات كما يحدث في واجهة الـ Frontend
-                aud_b64 = None
-                if final_audio:
-                    aud_b64 = "data:audio/webm;base64," + base64.b64encode(final_audio.read()).decode()
-                
-                img_b64 = None
-                if final_cam:
-                    img_b64 = "data:image/png;base64," + base64.b64encode(final_cam.read()).decode()
-
-                display_text = final_text if final_text else "رسالة وسائط 📸/🎙️"
-                st.session_state.messages.append({"role": "user", "content": display_text, "image": final_cam, "audio": final_audio})
-                
-                with st.chat_message("user"):
-                    st.write(display_text)
-                    if final_audio: st.audio(final_audio)
-                    if final_cam: st.image(final_cam, width=300)
-
-                with st.chat_message("assistant"):
-                    response_placeholder = st.empty()
-                    audio_placeholder = st.empty()
-                    with st.spinner("الأسطى بيفكر وبيجهز الرد..."):
-                        full_response = ""
-                        payload = {
-                            "message": final_text,
-                            "image_data": img_b64,
-                            "audio_data": aud_b64,
-                            "session_id": "streamlit_kiosk_session"
-                        }
-                        try:
-                            # استخدام الـ Streaming API الأصلية بتاعت الـ Kiosk لضمان أقصى سرعة وقوة
-                            response = requests.post(f"{API_BASE}/api/kiosk_chat", json=payload, headers=headers, stream=True)
-                            if response.status_code == 200:
-                                for line in response.iter_lines():
-                                    if line:
-                                        decoded = line.decode('utf-8').strip()
-                                        if decoded.startswith("data: "):
-                                            data_str = decoded[6:]
-                                            try:
-                                                data = json.loads(data_str)
-                                                if "chunk" in data:
-                                                    full_response += data["chunk"]
-                                                    response_placeholder.markdown(full_response + " ▌")
-                                                elif "done" in data:
-                                                    full_response = data["full"]
-                                                    response_placeholder.markdown(full_response)
-                                                elif "error" in data:
-                                                    st.error(data["error"])
-                                            except json.JSONDecodeError: pass
-                                
-                                # توليد رد صوتي TTS آلياً إذا كان هناك رد
-                                if full_response:
-                                    try:
-                                        tts_res = requests.post(f"{API_BASE}/api/tts", json={"text": full_response}, headers=headers)
-                                        if tts_res.status_code == 200:
-                                            audio_placeholder.audio(tts_res.content, format="audio/mpeg", autoplay=True)
-                                            st.session_state.messages.append({"role": "assistant", "content": full_response, "audio": tts_res.content})
-                                        else:
-                                            st.session_state.messages.append({"role": "assistant", "content": full_response})
-                                    except Exception as tts_e:
-                                        st.session_state.messages.append({"role": "assistant", "content": full_response})
-                            else:
-                                st.error(f"خطأ من الخادم: {response.status_code}")
-                        except Exception as e:
-                            st.error(f"فشل الاتصال بخادم الذكاء الاصطناعي: {e}")
-
-        elif page == "🔥 مراقبة Firebase":
-            st.markdown("## 🔥 مراقبة استخدام Firebase السحابي")
-            if st.button("🔄 تحديث البيانات"): pass 
+if "server_started" not in st.session_state:
+    if not is_server_running():
+        def run_server():
             try:
-                r = requests.get(f"{API_BASE}/api/firebase_usage", headers=headers)
-                if r.status_code == 200:
-                    data = r.json()
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("القراءات اليوم", f"{data['reads']:,}", f"من {data['reads_limit']:,} (المجاني)")
-                        st.progress(min(data["reads_percent"] / 100, 1.0))
-                    with col2:
-                        st.metric("الكتابات اليوم", f"{data['writes']:,}", f"من {data['writes_limit']:,} (المجاني)")
-                        st.progress(min(data["writes_percent"] / 100, 1.0))
-                else:
-                    st.error("السيرفر لا يستطيع جلب بيانات الاستخدام.")
+                config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+                server = uvicorn.Server(config)
+                # ✅ الحل السحري: منع uvicorn من التلاعب بإشارات النظام لتفادي الانهيار في الخيوط الفرعية
+                server.install_signal_handlers = lambda: None
+                server.run()
             except Exception as e:
-                st.error(f"خطأ: {e}")
+                logger.error(f"Failed to start backend server: {e}")
 
-        elif page == "⚙️ إعدادات النظام":
-            st.markdown("## ⚙️ إعدادات الورشة المتقدمة")
-            tab1, tab2, tab3 = st.tabs(["🤖 نماذج الذكاء", "🔥 Firebase", "🗄️ قاعدة البيانات"])
-            with tab1:
-                st.markdown("### مفاتيح ونماذج الـ LLM")
-                provider = st.selectbox("المزود", ["google", "openai", "anthropic", "custom"])
-                model = st.text_input("اسم الموديل", placeholder="gemini-1.5-flash")
+        with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
+            t = threading.Thread(target=run_server, daemon=True)
+            t.start()
+            for _ in range(10):
+                if is_server_running():
+                    break
+                time.sleep(0.5)
+    st.session_state.server_started = True
+
+API_BASE = "http://127.0.0.1:8000"
+
+# تنسيقات الواجهة لتشبه واجهة الكشك الأصلية
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+    html, body, [class*="css"] { font-family: 'Cairo', sans-serif; direction: rtl; text-align: right; }
+    .stChatMessage { border-radius: 15px !important; padding: 15px !important; margin-bottom: 15px !important; font-size: 1.1rem; }
+    div[data-testid="stChatMessage"]:nth-child(even) { background-color: rgba(255, 152, 0, 0.1); border-right: 4px solid #FF9800; }
+    div[data-testid="stChatMessage"]:nth-child(odd) { background-color: rgba(30, 30, 30, 0.8); border-right: 4px solid #2196F3; }
+    /* إخفاء الهيدر الافتراضي لإعطاء شكل التطبيق المستقل */
+    header {visibility: hidden;}
+    #MainMenu {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+def login(username, password):
+    try:
+        response = requests.post(f"{API_BASE}/api/streamlit_login", json={"username": username, "password": password})
+        if response.status_code == 200: return response.json()
+    except Exception as e:
+        st.error(f"خطأ في الاتصال بالسيرفر: {e}")
+    return None
+
+if "token" not in st.session_state: st.session_state.token = None
+if "user" not in st.session_state: st.session_state.user = None
+
+if not st.session_state.token:
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<h2 style='text-align: center; color: #FF9800;'><br>🔧 دخول الورشة</h2>", unsafe_allow_html=True)
+        username = st.text_input("اسم المستخدم", placeholder="worker أو admin")
+        password = st.text_input("كلمة السر", type="password")
+        if st.button("دخول المساعد 🚀", use_container_width=True):
+            if username and password:
+                result = login(username, password)
+                if result:
+                    st.session_state.token = result["access_token"]
+                    st.session_state.user = result["user"]
+                    st.rerun()
+                else:
+                    st.error("❌ بيانات خطأ، جرب تاني يا هندسة")
+            else:
+                st.warning("⚠️ أدخل اسم المستخدم وكلمة السر")
+else:
+    user = st.session_state.user
+    headers = {"Authorization": f"Bearer {st.session_state.token}"}
+    
+    with st.sidebar:
+        st.markdown(f"### 👷 أهلاً يا هندسة: <span style='color:#FF9800;'>{user['username']}</span>", unsafe_allow_html=True)
+        st.markdown("---")
+        if user["role"] == "admin":
+            page = st.radio("القائمة الرئيسية", ["💬 واجهة العمال (Kiosk)", "🔥 مراقبة Firebase", "⚙️ إعدادات النظام"])
+        else:
+            page = "💬 واجهة العمال (Kiosk)"
+            st.info("أنت مسجل كـ 'عامل'. لديك صلاحية المحادثة فقط.")
+            
+        st.markdown("---")
+        if st.button("🚪 تسجيل خروج", use_container_width=True):
+            st.session_state.token = None
+            st.session_state.user = None
+            if "messages" in st.session_state: st.session_state.messages = []
+            st.rerun()
+
+    if page == "💬 واجهة العمال (Kiosk)":
+        st.markdown("## 🎙️ مساعد الورشة الذكي (الأسطى)")
+        st.caption("الأسطى معاك، اكتب مشكلتك أو ارفع صورة العطل أو سجل صوتك بالضغط على (إرفاق وسائط).")
+        
+        if "messages" not in st.session_state: st.session_state.messages = []
+        
+        # عرض الرسائل السابقة مع الوسائط
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+                if "audio" in msg and msg["audio"]:
+                    st.audio(msg["audio"])
+                if "image" in msg and msg["image"]:
+                    st.image(msg["image"], width=300)
+
+        # منطقة الإدخال الذكية
+        prompt = st.chat_input("اكتب سؤالك للأسطى هنا...")
+        
+        with st.expander("📸 إرفاق وسائط (صورة أو تسجيل صوتي)", expanded=False):
+            with st.form("media_form", clear_on_submit=True):
+                st.info("💡 ملاحظة: يجب إعطاء المتصفح صلاحية استخدام الميكروفون والكاميرا.")
                 c1, c2 = st.columns(2)
-                with c1:
-                    openai_key = st.text_input("مفتاح OpenAI", type="password")
-                    google_key = st.text_input("مفتاح Google", type="password")
-                with c2:
-                    anthropic_key = st.text_input("مفتاح Anthropic", type="password")
-                    base_url = st.text_input("رابط الـ API المخصص (Base URL)")
-                if st.button("💾 حفظ المفاتيح", use_container_width=True):
-                    r = requests.post(f"{API_BASE}/api/settings/save_llm_json", json={
-                        "llm_provider": provider, "llm_model": model, "api_base_url": base_url,
-                        "openai_key": openai_key, "anthropic_key": anthropic_key, "google_key": google_key
-                    }, headers=headers)
-                    if r.status_code == 200: st.success("✅ تم الحفظ بنجاح!")
+                with c1: audio_val = st.audio_input("🎙️ سجل سؤالك")
+                with c2: cam_val = st.camera_input("📸 صور العطل")
+                text_val = st.text_input("💬 تعليق إضافي مع الصورة/الصوت (اختياري)")
+                submit_media = st.form_submit_button("إرسال الوسائط للأسطى 🚀", use_container_width=True)
+
+        # منطق المعالجة الشامل لدمج الواجهة القديمة
+        trigger = False
+        final_text = ""
+        final_audio = None
+        final_cam = None
+
+        if prompt:
+            trigger = True
+            final_text = prompt
+        elif submit_media and (audio_val or cam_val or text_val):
+            trigger = True
+            final_text = text_val
+            final_audio = audio_val
+            final_cam = cam_val
+
+        if trigger:
+            # تحضير وتشفير البيانات كما يحدث في واجهة الـ Frontend
+            aud_b64 = None
+            if final_audio:
+                aud_b64 = "data:audio/webm;base64," + base64.b64encode(final_audio.read()).decode()
+            
+            img_b64 = None
+            if final_cam:
+                img_b64 = "data:image/png;base64," + base64.b64encode(final_cam.read()).decode()
+
+            display_text = final_text if final_text else "رسالة وسائط 📸/🎙️"
+            st.session_state.messages.append({"role": "user", "content": display_text, "image": final_cam, "audio": final_audio})
+            
+            with st.chat_message("user"):
+                st.write(display_text)
+                if final_audio: st.audio(final_audio)
+                if final_cam: st.image(final_cam, width=300)
+
+            with st.chat_message("assistant"):
+                response_placeholder = st.empty()
+                audio_placeholder = st.empty()
+                with st.spinner("الأسطى بيفكر وبيجهز الرد..."):
+                    full_response = ""
+                    payload = {
+                        "message": final_text,
+                        "image_data": img_b64,
+                        "audio_data": aud_b64,
+                        "session_id": "streamlit_kiosk_session"
+                    }
+                    try:
+                        # استخدام الـ Streaming API الأصلية بتاعت الـ Kiosk لضمان أقصى سرعة وقوة
+                        response = requests.post(f"{API_BASE}/api/kiosk_chat", json=payload, headers=headers, stream=True)
+                        if response.status_code == 200:
+                            for line in response.iter_lines():
+                                if line:
+                                    decoded = line.decode('utf-8').strip()
+                                    if decoded.startswith("data: "):
+                                        data_str = decoded[6:]
+                                        try:
+                                            data = json.loads(data_str)
+                                            if "chunk" in data:
+                                                full_response += data["chunk"]
+                                                response_placeholder.markdown(full_response + " ▌")
+                                            elif "done" in data:
+                                                full_response = data["full"]
+                                                response_placeholder.markdown(full_response)
+                                            elif "error" in data:
+                                                st.error(data["error"])
+                                        except json.JSONDecodeError: pass
+                            
+                            # توليد رد صوتي TTS آلياً إذا كان هناك رد
+                            if full_response:
+                                try:
+                                    tts_res = requests.post(f"{API_BASE}/api/tts", json={"text": full_response}, headers=headers)
+                                    if tts_res.status_code == 200:
+                                        audio_placeholder.audio(tts_res.content, format="audio/mpeg", autoplay=True)
+                                        st.session_state.messages.append({"role": "assistant", "content": full_response, "audio": tts_res.content})
+                                    else:
+                                        st.session_state.messages.append({"role": "assistant", "content": full_response})
+                                except Exception as tts_e:
+                                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                        else:
+                            st.error(f"خطأ من الخادم: {response.status_code}")
+                    except Exception as e:
+                        st.error(f"فشل الاتصال بخادم الذكاء الاصطناعي: {e}")
+
+    elif page == "🔥 مراقبة Firebase":
+        st.markdown("## 🔥 مراقبة استخدام Firebase السحابي")
+        if st.button("🔄 تحديث البيانات"): pass 
+        try:
+            r = requests.get(f"{API_BASE}/api/firebase_usage", headers=headers)
+            if r.status_code == 200:
+                data = r.json()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("القراءات اليوم", f"{data['reads']:,}", f"من {data['reads_limit']:,} (المجاني)")
+                    st.progress(min(data["reads_percent"] / 100, 1.0))
+                with col2:
+                    st.metric("الكتابات اليوم", f"{data['writes']:,}", f"من {data['writes_limit']:,} (المجاني)")
+                    st.progress(min(data["writes_percent"] / 100, 1.0))
+            else:
+                st.error("السيرفر لا يستطيع جلب بيانات الاستخدام.")
+        except Exception as e:
+            st.error(f"خطأ: {e}")
+
+    elif page == "⚙️ إعدادات النظام":
+        st.markdown("## ⚙️ إعدادات الورشة المتقدمة")
+        tab1, tab2, tab3 = st.tabs(["🤖 نماذج الذكاء", "🔥 Firebase", "🗄️ قاعدة البيانات"])
+        with tab1:
+            st.markdown("### مفاتيح ونماذج الـ LLM")
+            provider = st.selectbox("المزود", ["google", "openai", "anthropic", "custom"])
+            model = st.text_input("اسم الموديل", placeholder="gemini-1.5-flash")
+            c1, c2 = st.columns(2)
+            with c1:
+                openai_key = st.text_input("مفتاح OpenAI", type="password")
+                google_key = st.text_input("مفتاح Google", type="password")
+            with c2:
+                anthropic_key = st.text_input("مفتاح Anthropic", type="password")
+                base_url = st.text_input("رابط الـ API المخصص (Base URL)")
+            if st.button("💾 حفظ المفاتيح", use_container_width=True):
+                r = requests.post(f"{API_BASE}/api/settings/save_llm_json", json={
+                    "llm_provider": provider, "llm_model": model, "api_base_url": base_url,
+                    "openai_key": openai_key, "anthropic_key": anthropic_key, "google_key": google_key
+                }, headers=headers)
+                if r.status_code == 200: st.success("✅ تم الحفظ بنجاح!")
+                else: st.error("❌ فشل الحفظ")
+        with tab2:
+            st.markdown("### 🔥 ربط Firebase Firestore")
+            firebase_json = st.text_area("الصق محتوى ملف JSON هنا:", height=200)
+            if st.button("🔗 حفظ وربط Firebase", use_container_width=True):
+                if firebase_json:
+                    r = requests.post(f"{API_BASE}/api/settings/save_firebase", json={"firebase_credentials": firebase_json}, headers=headers)
+                    if r.status_code == 200: st.success("✅ تم ربط Firebase!")
+                    else: st.error("❌ حدث خطأ، تأكد من صحة النص.")
+        with tab3:
+            st.markdown("### 🗄️ ربط قاعدة بيانات سحابية (PostgreSQL / MySQL)")
+            db_url = st.text_input("رابط قاعدة البيانات (Database URL)", type="password")
+            if st.button("🔗 حفظ قاعدة البيانات", use_container_width=True):
+                if db_url:
+                    r = requests.post(f"{API_BASE}/api/settings/save_database", json={"database_url": db_url}, headers=headers)
+                    if r.status_code == 200: st.success("✅ تم الحفظ! سيعمل السيرفر بالرابط الجديد بعد إعادة التشغيل.")
                     else: st.error("❌ فشل الحفظ")
-            with tab2:
-                st.markdown("### 🔥 ربط Firebase Firestore")
-                firebase_json = st.text_area("الصق محتوى ملف JSON هنا:", height=200)
-                if st.button("🔗 حفظ وربط Firebase", use_container_width=True):
-                    if firebase_json:
-                        r = requests.post(f"{API_BASE}/api/settings/save_firebase", json={"firebase_credentials": firebase_json}, headers=headers)
-                        if r.status_code == 200: st.success("✅ تم ربط Firebase!")
-                        else: st.error("❌ حدث خطأ، تأكد من صحة النص.")
-            with tab3:
-                st.markdown("### 🗄️ ربط قاعدة بيانات سحابية (PostgreSQL / MySQL)")
-                db_url = st.text_input("رابط قاعدة البيانات (Database URL)", type="password")
-                if st.button("🔗 حفظ قاعدة البيانات", use_container_width=True):
-                    if db_url:
-                        r = requests.post(f"{API_BASE}/api/settings/save_database", json={"database_url": db_url}, headers=headers)
-                        if r.status_code == 200: st.success("✅ تم الحفظ! سيعمل السيرفر بالرابط الجديد بعد إعادة التشغيل.")
-                        else: st.error("❌ فشل الحفظ")
