@@ -131,18 +131,17 @@ if IS_PRODUCTION:
 else:
     SQLALCHEMY_DATABASE_URL = Vault.get_secret("DATABASE_URL", "sqlite+aiosqlite:///./workshop_db.sqlite")
 
-# استخدام كاش Streamlit لمنع استنزاف الاتصالات بقاعدة البيانات مع كل تحديث للواجهة
-@st.cache_resource
-def get_db_setup(_db_url):
+# تم إزالة كاش Streamlit لتفادي خطأ st.set_page_config الفادح وتعارض خيوط asyncio
+def get_db_setup(db_url):
     engine_kwargs = {"echo": False}
-    if not _db_url.startswith("sqlite"):
+    if not db_url.startswith("sqlite"):
         engine_kwargs.update({
             "pool_size": int(Vault.get_secret("DB_POOL_SIZE", 5)),       
             "max_overflow": int(Vault.get_secret("DB_MAX_OVERFLOW", 10)),
             "pool_recycle": 1800,                                        
             "pool_pre_ping": True                                        
         })
-    _engine = create_async_engine(_db_url, **engine_kwargs)
+    _engine = create_async_engine(db_url, **engine_kwargs)
     _SessionLocal = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
     return _engine, _SessionLocal
 
@@ -2191,6 +2190,7 @@ async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSessi
 # واجهة Streamlit السحرية (تم دمج واجهة الكشك الأصلية هنا بالكامل)
 # =====================================================================
 if __name__ == "__main__":
+    import streamlit as st
     st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
 
     def is_server_running(port=8000):
