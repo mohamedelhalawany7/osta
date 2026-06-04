@@ -1,860 +1,805 @@
-import base64
+﻿import base64
+import hashlib
 import io
 import json
 import os
-import sqlite3
+import secrets
 import tempfile
-import time
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import pandas as pd
+import bcrypt
+import firebase_admin
+import google.generativeai as genai
 import streamlit as st
-from bs4 import BeautifulSoup
+from anthropic import Anthropic
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from firebase_admin import credentials, firestore
 from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-from streamlit_mic_recorder import mic_recorder
+from pinecone import Pinecone
+from pypdf import PdfReader
 
-try:
-    import docx2txt
-except Exception:
-    docx2txt = None
-
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-except Exception:
-    firebase_admin = None
-    credentials = None
-    firestore = None
+load_dotenv()
 
 
-APP_DIR = Path(__file__).resolve().parent
-LOCAL_DB = APP_DIR / "local_app.db"
-UPLOAD_DIR = APP_DIR / "uploaded_files"
-UPLOAD_DIR.mkdir(exist_ok=True)
+DEFAULT_PROMPT = """أنت 'الأسطى بلية'، أقدم وأشطر صنايعي ومهندس في ورشة ميكانيكا وصيانة ضواغط هواء ومجففات في مصر.
+العمال اللي بيكلموك صنايعية على قدهم ومابيعرفوش يقرأوا ويكتبوا، عشان كده:
+1. اتكلم معاهم بلهجة مصرية بلدي صميمة، زي الصنايعية الكبار في الورش.
+2. اشرح المشكلة وحلها ببساطة جدا وبدون مصطلحات إنجليزي مكلكعة.
+3. خليك جدع ومشجع وبتحل المشاكل بخطوات عملية 1، 2، 3.
+4. لو بعتولك صورة، ركز فيها كويس وقولهم فيها إيه بالظبط وإيه اللي بايظ وكيفية صيانته.
+5. اعتمد في إجاباتك على معلومات الكتالوجات المرفقة، وضيف عليها خبرتك كأسطى كبير في السوق.
+"""
 
-DEFAULT_SYSTEM_PROMPT = """
-انت مساعد صيانة وتصنيع معدني داخل ورشة CNC ومخارط وفرايز ومقاشط ومثاقب وليزر ولحام وضواغط ومجففات هواء.
-ردك يكون بالمصري العامي الصنايعي، واضح وقصير ومنظم.
-ابدأ بتشخيص احتمالات العطل، ثم خطوات فحص آمنة، ثم الحل، ثم تحذيرات السلامة.
-لو السؤال فيه خطر كهرباء/هواء مضغوط/دوران/ليزر/لحام، اذكر فصل الطاقة وتفريغ الضغط ولبس مهمات الوقاية قبل أي خطوة.
-لو المعلومات من ملفات الشركة مش كفاية، قول كده بصراحة واسأل عن قراءة العداد أو الصوت أو الكود أو نوع الماكينة.
+TECHNICAL_KEYWORDS = [
+    "ضاغط",
+    "مجفف",
+    "فلتر",
+    "أويل",
+    "بيلت",
+    "عطل",
+    "ضغط",
+    "بارد",
+    "حرارة",
+    "زيت",
+    "صيانة",
+    "ماكينة",
+    "موتور",
+    "صوت",
+    "مشكلة",
+    "صورة",
+    "الحل",
+    "خربان",
+    "بايظ",
+    "مكسور",
+]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@st.cache_resource
+def get_db():
+    raw = os.getenv("FIREBASE_CREDENTIALS", "")
+    if not raw:
+        raw = st.secrets.get("FIREBASE_CREDENTIALS", "") if hasattr(st, "secrets") else ""
+    if not raw:
+        raise RuntimeError("FIREBASE_CREDENTIALS is missing.")
+
+    cred_dict = json.loads(raw)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(credentials.Certificate(cred_dict))
+    return firestore.client()
+
+
+@st.cache_resource
+def get_cipher():
+    key = os.getenv("FERNET_KEY", "")
+    if not key:
+        key = st.secrets.get("FERNET_KEY", "") if hasattr(st, "secrets") else ""
+    if not key:
+        key = Fernet.generate_key().decode()
+        st.warning("FERNET_KEY غير موجود. تم إنشاء مفتاح مؤقت، ضع مفتاحا ثابتا في .env قبل الإنتاج.")
+    return Fernet(key.encode())
+
+
+def encrypt_val(value: str) -> str:
+    return get_cipher().encrypt(value.encode()).decode() if value else ""
+
+
+def decrypt_val(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return get_cipher().decrypt(value.encode()).decode()
+    except Exception:
+        return value
+
+
+def password_hash(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+
+
+def create_id() -> str:
+    return str(uuid.uuid4())
+
+
+def ensure_seed_data(db) -> None:
+    tenants = list(db.collection("tenants").limit(1).stream())
+    if tenants:
+        return
+
+    tenant_id = create_id()
+    tenant_name = os.getenv("DEFAULT_TENANT_NAME", "ورشة الصيانة والتصنيع")
+    db.collection("tenants").document(tenant_id).set(
+        {
+            "name": tenant_name,
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "api_base_url": "",
+            "openai_api_key": "",
+            "anthropic_api_key": "",
+            "google_api_key": "",
+            "pinecone_api_key": "",
+            "pinecone_index": "",
+            "workshop_prompt": DEFAULT_PROMPT,
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+    )
+
+    users = [
+        (
+            os.getenv("DEFAULT_ADMIN_USERNAME", "admin"),
+            os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123"),
+            "admin",
+        ),
+        (
+            os.getenv("DEFAULT_WORKER_USERNAME", "worker"),
+            os.getenv("DEFAULT_WORKER_PASSWORD", "1234"),
+            "worker",
+        ),
+    ]
+    for username, password, role in users:
+        db.collection("users").document(create_id()).set(
+            {
+                "username": username,
+                "hashed_password": password_hash(password),
+                "role": role,
+                "tenant_id": tenant_id,
+                "created_at": utc_now(),
+            }
+        )
+
+
+def get_user_by_username(db, username: str) -> Optional[Dict]:
+    docs = db.collection("users").where("username", "==", username).limit(1).stream()
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        return data
+    return None
+
+
+def authenticate(db, username: str, password: str) -> Optional[Dict]:
+    user = get_user_by_username(db, username.strip())
+    if not user or not verify_password(password, user["hashed_password"]):
+        return None
+    tenant = get_tenant(db, user["tenant_id"])
+    user["tenant"] = tenant
+    return user
+
+
+def get_tenant(db, tenant_id: str) -> Dict:
+    doc = db.collection("tenants").document(tenant_id).get()
+    if not doc.exists:
+        raise RuntimeError("Tenant not found.")
+    data = doc.to_dict()
+    data["id"] = doc.id
+    return data
+
+
+def save_tenant_settings(db, tenant_id: str, data: Dict) -> None:
+    encrypted_keys = {
+        key: encrypt_val(value)
+        for key, value in data.items()
+        if key.endswith("_api_key") and value
+    }
+    update = {**data, **encrypted_keys, "updated_at": utc_now()}
+    db.collection("tenants").document(tenant_id).update(update)
+
+
+def list_sessions(db, tenant_id: str, limit: int = 30) -> List[Dict]:
+    query = (
+        db.collection("chat_sessions")
+        .where("tenant_id", "==", tenant_id)
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+    return [with_id(doc) for doc in query.stream()]
+
+
+def get_or_create_session(db, tenant_id: str, user_id: str, session_id: Optional[str] = None) -> Dict:
+    if session_id:
+        doc = db.collection("chat_sessions").document(session_id).get()
+        if doc.exists:
+            return with_id(doc)
+
+    session_id = create_id()
+    data = {
+        "title": "محادثة جديدة",
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+    db.collection("chat_sessions").document(session_id).set(data)
+    data["id"] = session_id
+    return data
+
+
+def rename_session_from_message(db, session_id: str, current_title: str, message: str) -> None:
+    if current_title != "محادثة جديدة":
+        return
+    title = " ".join((message or "محادثة صوتية").split()[:4])
+    db.collection("chat_sessions").document(session_id).update(
+        {"title": title or "محادثة جديدة", "updated_at": utc_now()}
+    )
+
+
+def save_message(db, tenant_id: str, session_id: str, role: str, content: str) -> None:
+    clean = content[:4000] if "data:image" not in content else "[صورة مرفقة]"
+    db.collection("conversation_history").document(create_id()).set(
+        {
+            "tenant_id": tenant_id,
+            "session_id": session_id,
+            "role": role,
+            "content": clean,
+            "created_at": utc_now(),
+        }
+    )
+    db.collection("chat_sessions").document(session_id).update({"updated_at": utc_now()})
+
+
+def load_messages(db, session_id: str, limit: int = 100) -> List[Dict]:
+    query = (
+        db.collection("conversation_history")
+        .where("session_id", "==", session_id)
+        .order_by("created_at")
+        .limit(limit)
+    )
+    return [with_id(doc) for doc in query.stream()]
+
+
+def history_text(db, session_id: str, limit: int = 6) -> str:
+    messages = load_messages(db, session_id, limit=limit)
+    return "\n".join(f"{m['role']}: {m['content']}" for m in messages[-limit:])
+
+
+def with_id(doc) -> Dict:
+    data = doc.to_dict()
+    data["id"] = doc.id
+    return data
+
+
+def is_technical_query(message: str) -> bool:
+    if not message:
+        return True
+    return any(word in message for word in TECHNICAL_KEYWORDS)
+
+
+def extract_pdf_text(file_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return "\n".join(pages)
+
+
+def chunk_text(text: str, chunk_size: int = 1100, overlap: int = 180) -> List[str]:
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = max(0, end - overlap)
+    return chunks
+
+
+def openai_client(api_key: str, base_url: str = "") -> OpenAI:
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def embed_texts(openai_key: str, texts: List[str]) -> List[List[float]]:
+    client = openai_client(openai_key)
+    result = client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [item.embedding for item in result.data]
+
+
+def pinecone_index(api_key: str, index_name: str):
+    return Pinecone(api_key=api_key).Index(index_name)
+
+
+def upsert_document_to_pinecone(
+    db,
+    tenant: Dict,
+    filename: str,
+    file_bytes: bytes,
+) -> Tuple[int, str]:
+    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
+    pinecone_key = decrypt_val(tenant.get("pinecone_api_key", ""))
+    index_name = tenant.get("pinecone_index", "")
+    if not openai_key or not pinecone_key or not index_name:
+        raise RuntimeError("OpenAI key, Pinecone key, and Pinecone index are required.")
+
+    text = extract_pdf_text(file_bytes)
+    chunks = chunk_text(text)
+    if not chunks:
+        raise RuntimeError("لم يتم استخراج نص من الملف.")
+
+    vectors = embed_texts(openai_key, chunks)
+    index = pinecone_index(pinecone_key, index_name)
+    namespace = f"tenant_{tenant['id']}"
+    doc_id = create_id()
+    pinecone_vectors = []
+    for i, (chunk, values) in enumerate(zip(chunks, vectors)):
+        stable_id = hashlib.sha256(f"{doc_id}:{i}:{filename}".encode()).hexdigest()
+        pinecone_vectors.append(
+            {
+                "id": stable_id,
+                "values": values,
+                "metadata": {"text": chunk, "filename": filename, "tenant_id": tenant["id"]},
+            }
+        )
+    index.upsert(vectors=pinecone_vectors, namespace=namespace)
+    db.collection("uploaded_documents").document(doc_id).set(
+        {
+            "tenant_id": tenant["id"],
+            "filename": filename,
+            "chunks": len(chunks),
+            "created_at": utc_now(),
+        }
+    )
+    return len(chunks), doc_id
+
+
+def rag_context(tenant: Dict, message: str, k: int = 3) -> str:
+    if not is_technical_query(message):
+        return ""
+    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
+    pinecone_key = decrypt_val(tenant.get("pinecone_api_key", ""))
+    index_name = tenant.get("pinecone_index", "")
+    if not openai_key or not pinecone_key or not index_name:
+        return ""
+
+    vector = embed_texts(openai_key, [message or "صيانة ضاغط هواء"])[0]
+    index = pinecone_index(pinecone_key, index_name)
+    result = index.query(
+        vector=vector,
+        top_k=k,
+        namespace=f"tenant_{tenant['id']}",
+        include_metadata=True,
+    )
+    matches = result.get("matches", []) if isinstance(result, dict) else result.matches
+    texts = []
+    for match in matches:
+        metadata = match.get("metadata", {}) if isinstance(match, dict) else match.metadata
+        if metadata and metadata.get("text"):
+            texts.append(metadata["text"])
+    return "\n\n".join(texts)
+
+
+def image_to_data_url(uploaded_file) -> Optional[str]:
+    if not uploaded_file:
+        return None
+    data = uploaded_file.getvalue()
+    mime = uploaded_file.type or "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def transcribe_audio(openai_key: str, audio_bytes: bytes, suffix: str = ".wav") -> str:
+    client = openai_client(openai_key)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+        temp.write(audio_bytes)
+        temp_path = temp.name
+    try:
+        with open(temp_path, "rb") as audio:
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=audio, language="ar")
+            return transcript.text
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def build_system_prompt(tenant: Dict, history: str, context: str) -> str:
+    return f"""{tenant.get('workshop_prompt') or DEFAULT_PROMPT}
+
+تاريخ المحادثة السابقة:
+{history}
+
+معلومات فنية من الكتالوجات:
+{context}
 """
 
 
-st.set_page_config(
-    page_title="CNC RAG Voice Assistant",
-    page_icon="⚙",
-    layout="wide",
-    initial_sidebar_state="expanded",
+def stream_openai(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
+    key = decrypt_val(tenant.get("openai_api_key", ""))
+    if not key:
+        raise RuntimeError("مفتاح OpenAI مفقود.")
+    client = openai_client(key, tenant.get("api_base_url", ""))
+    user_content = [{"type": "text", "text": message}]
+    if image_url:
+        user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+    stream = client.chat.completions.create(
+        model=tenant.get("llm_model") or "gpt-4o-mini",
+        temperature=0.3,
+        stream=True,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def stream_anthropic(tenant: Dict, system_prompt: str, message: str) -> Iterable[str]:
+    key = decrypt_val(tenant.get("anthropic_api_key", ""))
+    if not key:
+        raise RuntimeError("مفتاح Anthropic مفقود.")
+    client = Anthropic(api_key=key)
+    with client.messages.stream(
+        model=tenant.get("llm_model") or "claude-3-5-haiku-latest",
+        max_tokens=1600,
+        temperature=0.3,
+        system=system_prompt,
+        messages=[{"role": "user", "content": message}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+
+
+def stream_google(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
+    key = decrypt_val(tenant.get("google_api_key", ""))
+    if not key:
+        raise RuntimeError("مفتاح Google Gemini مفقود.")
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel(tenant.get("llm_model") or "gemini-1.5-flash")
+    parts = [system_prompt, message]
+    if image_url:
+        header, encoded = image_url.split(",", 1)
+        mime = header.replace("data:", "").replace(";base64", "")
+        parts.append({"mime_type": mime, "data": base64.b64decode(encoded)})
+    response = model.generate_content(parts, stream=True)
+    for chunk in response:
+        if chunk.text:
+            yield chunk.text
+
+
+def stream_llm(tenant: Dict, system_prompt: str, message: str, image_url: Optional[str]) -> Iterable[str]:
+    provider = tenant.get("llm_provider", "openai")
+    if provider == "openai" or provider == "custom":
+        return stream_openai(tenant, system_prompt, message, image_url)
+    if provider == "anthropic":
+        return stream_anthropic(tenant, system_prompt, message)
+    if provider == "google":
+        return stream_google(tenant, system_prompt, message, image_url)
+    raise RuntimeError("مزود الخدمة المختار غير مدعوم.")
+
+
+def generate_tts(tenant: Dict, text: str) -> bytes:
+    key = decrypt_val(tenant.get("openai_api_key", ""))
+    if not key:
+        raise RuntimeError("مفتاح OpenAI مطلوب لتوليد الصوت.")
+    audio = openai_client(key).audio.speech.create(model="tts-1", voice="onyx", input=text[:4000])
+    return audio.read()
+
+
+def analyze_machine_issues(db, tenant: Dict) -> Optional[str]:
+    openai_key = decrypt_val(tenant.get("openai_api_key", ""))
+    if not openai_key:
+        return None
+
+    cutoff = utc_now() - timedelta(days=30)
+    query = (
+        db.collection("conversation_history")
+        .where("tenant_id", "==", tenant["id"])
+        .where("created_at", ">=", cutoff)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(500)
+    )
+    history = [doc.to_dict() for doc in query.stream()]
+    if len(history) < 10:
+        return None
+
+    text_log = "\n".join(f"{row['role']}: {row['content']}" for row in history)
+    prompt = """بصفتك مهندس صيانة ذكي، حلل سجل محادثات العمال خلال الشهر الماضي.
+هل يوجد عطل في ماكينة معينة أو ضاغط هواء معين تكرر السؤال عنه أكثر من مرتين؟
+إذا وجدت تكرارا يعطي مؤشرا على مشكلة مزمنة، اكتب تنبيها واحدا مباشرا وموجزا.
+إذا كانت الأمور طبيعية فاكتب فقط: لا يوجد"""
+    client = openai_client(openai_key)
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text_log}],
+    )
+    content = res.choices[0].message.content or ""
+    if "لا يوجد" in content:
+        return None
+    db.collection("alerts").document(create_id()).set(
+        {"tenant_id": tenant["id"], "message": f"تنبيه ذكي: {content}", "created_at": utc_now()}
+    )
+    return content
+
+
+def list_alerts(db, tenant_id: str, limit: int = 20) -> List[Dict]:
+    query = (
+        db.collection("alerts")
+        .where("tenant_id", "==", tenant_id)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+    return [with_id(doc) for doc in query.stream()]
+
+
+def list_documents(db, tenant_id: str, limit: int = 50) -> List[Dict]:
+    query = (
+        db.collection("uploaded_documents")
+        .where("tenant_id", "==", tenant_id)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+    return [with_id(doc) for doc in query.stream()]
+
+# =====================================================================
+# Streamlit UI
+# =====================================================================
+
+st.set_page_config(page_title="الأسطى بلية", page_icon="🛠️", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    html, body, [class*="css"] { direction: rtl; }
+    .stChatMessage { text-align: right; }
+    [data-testid="stSidebar"] { direction: rtl; }
+    textarea, input { direction: rtl; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
-def inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        :root {
-            --bg0: #05070d;
-            --bg1: #0a1020;
-            --cyan: #00e5ff;
-            --lime: #b6ff3b;
-            --pink: #ff2bd6;
-            --orange: #ffb000;
-            --muted: #a9b5c7;
-            --glass: rgba(255, 255, 255, .075);
-            --stroke: rgba(255, 255, 255, .17);
-        }
-        html, body, [data-testid="stAppViewContainer"] {
-            direction: rtl;
-            background:
-              radial-gradient(circle at 8% 8%, rgba(0, 229, 255, .22), transparent 26rem),
-              radial-gradient(circle at 88% 20%, rgba(255, 43, 214, .18), transparent 24rem),
-              linear-gradient(135deg, #04070d 0%, #0d1020 42%, #07151a 100%);
-            color: #eef7ff;
-        }
-        [data-testid="stHeader"] { background: transparent; }
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, rgba(7, 13, 28, .88), rgba(4, 7, 13, .96));
-            border-left: 1px solid rgba(255, 255, 255, .14);
-        }
-        .block-container {
-            padding-top: 1.5rem;
-            max-width: 1420px;
-        }
-        h1, h2, h3 { letter-spacing: 0; }
-        h1 {
-            font-size: clamp(2rem, 4vw, 4.6rem);
-            line-height: 1.04;
-            margin-bottom: .35rem;
-        }
-        .hero {
-            padding: 1.2rem 0 1.1rem;
-            border-bottom: 1px solid rgba(255,255,255,.12);
-            margin-bottom: 1rem;
-        }
-        .hero small {
-            color: var(--lime);
-            font-weight: 800;
-            letter-spacing: .08em;
-        }
-        .glass {
-            background: linear-gradient(135deg, rgba(255,255,255,.11), rgba(255,255,255,.045));
-            border: 1px solid var(--stroke);
-            box-shadow: 0 24px 80px rgba(0,0,0,.32);
-            backdrop-filter: blur(18px);
-            border-radius: 8px;
-            padding: 1rem;
-        }
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: .75rem;
-            margin: .8rem 0 1.2rem;
-        }
-        .metric-tile {
-            min-height: 92px;
-            border: 1px solid rgba(255,255,255,.14);
-            border-radius: 8px;
-            padding: .9rem;
-            background: rgba(255,255,255,.06);
-        }
-        .metric-tile b {
-            display: block;
-            font-size: 1.5rem;
-            color: white;
-        }
-        .metric-tile span { color: var(--muted); font-size: .9rem; }
-        .chat-user, .chat-ai {
-            border-radius: 8px;
-            padding: .95rem 1rem;
-            margin: .65rem 0;
-            border: 1px solid rgba(255,255,255,.13);
-        }
-        .chat-user {
-            background: linear-gradient(135deg, rgba(0,229,255,.17), rgba(0,229,255,.045));
-        }
-        .chat-ai {
-            background: linear-gradient(135deg, rgba(182,255,59,.13), rgba(255,43,214,.055));
-        }
-        .source-chip {
-            display: inline-block;
-            margin: .2rem .15rem;
-            padding: .28rem .55rem;
-            border: 1px solid rgba(0,229,255,.35);
-            color: #dffbff;
-            border-radius: 999px;
-            background: rgba(0,229,255,.08);
-            font-size: .82rem;
-        }
-        .stButton>button, .stDownloadButton>button {
-            border-radius: 8px;
-            border: 1px solid rgba(0,229,255,.42);
-            background: linear-gradient(135deg, rgba(0,229,255,.22), rgba(255,43,214,.16));
-            color: white;
-            min-height: 2.55rem;
-            font-weight: 800;
-        }
-        .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"],
-        .stNumberInput input {
-            border-radius: 8px;
-            border-color: rgba(255,255,255,.18) !important;
-            background: rgba(255,255,255,.07) !important;
-            color: white !important;
-        }
-        [data-testid="stFileUploader"] {
-            border: 1px dashed rgba(0,229,255,.34);
-            border-radius: 8px;
-            padding: .7rem;
-            background: rgba(255,255,255,.045);
-        }
-        .status-ok { color: var(--lime); font-weight: 800; }
-        .status-bad { color: #ff6b8b; font-weight: 800; }
-        .caption { color: var(--muted); font-size: .92rem; }
-        @media (max-width: 720px) {
-            .block-container { padding: .9rem .75rem 2rem; }
-            h1 { font-size: 2rem; }
-            .glass { padding: .75rem; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def init_state() -> None:
+    st.session_state.setdefault("user", None)
+    st.session_state.setdefault("session_id", None)
+    st.session_state.setdefault("last_answer", "")
 
 
-def init_local_db() -> None:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                pin TEXT NOT NULL,
-                role TEXT NOT NULL,
-                can_chat INTEGER DEFAULT 1,
-                can_upload INTEGER DEFAULT 0,
-                can_settings INTEGER DEFAULT 0,
-                can_users INTEGER DEFAULT 0
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                namespace TEXT NOT NULL,
-                chunks INTEGER NOT NULL,
-                uploaded_by TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        admin_count = con.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
-        if admin_count == 0:
-            con.execute(
-                """
-                INSERT OR IGNORE INTO users
-                (id, name, pin, role, can_chat, can_upload, can_settings, can_users)
-                VALUES (?, ?, ?, ?, 1, 1, 1, 1)
-                """,
-                ("admin", "المدير", "1234", "admin"),
-            )
-        con.commit()
+def login_view(db) -> None:
+    st.title("الأسطى بلية")
+    st.caption("مساعد الورشة الذكي - Streamlit + Firebase + Pinecone")
+
+    with st.form("login_form"):
+        username = st.text_input("اسم المستخدم")
+        password = st.text_input("كلمة المرور", type="password")
+        submitted = st.form_submit_button("دخول", use_container_width=True)
+
+    if submitted:
+        user = authenticate(db, username, password)
+        if not user:
+            st.error("اسم المستخدم أو كلمة المرور غير صحيح.")
+            return
+        st.session_state.user = user
+        st.session_state.session_id = None
+        st.rerun()
 
 
-def get_setting(key: str, default: str = "") -> str:
-    if key in st.session_state:
-        return st.session_state[key]
-    with sqlite3.connect(LOCAL_DB) as con:
-        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    value = row[0] if row else default
-    st.session_state[key] = value
-    return value
+def sidebar(db):
+    user = st.session_state.user
+    tenant = get_tenant(db, user["tenant_id"])
+    user["tenant"] = tenant
 
+    st.sidebar.title("الورشة")
+    st.sidebar.write(tenant["name"])
+    st.sidebar.caption(f"المستخدم: {user['username']} - {user['role']}")
 
-def set_setting(key: str, value: str) -> None:
-    st.session_state[key] = value
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute(
-            "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        con.commit()
+    if st.sidebar.button("محادثة جديدة", use_container_width=True):
+        session = get_or_create_session(db, tenant["id"], user["id"])
+        st.session_state.session_id = session["id"]
+        st.rerun()
 
+    sessions = list_sessions(db, tenant["id"])
+    options = {s["title"]: s["id"] for s in sessions}
+    if sessions:
+        labels = [s["title"] for s in sessions]
+        current_label = next((s["title"] for s in sessions if s["id"] == st.session_state.session_id), labels[0])
+        selected = st.sidebar.selectbox("المحادثات", labels, index=labels.index(current_label))
+        st.session_state.session_id = options[selected]
 
-def effective_secret(name: str, setting_key: str = "") -> str:
-    return os.getenv(name) or get_setting(setting_key or name.lower(), "")
-
-
-def get_openai_client() -> Optional[OpenAI]:
-    key = effective_secret("OPENAI_API_KEY", "openai_api_key")
-    if not key:
-        return None
-    return OpenAI(api_key=key)
-
-
-def get_pinecone_index():
-    key = effective_secret("PINECONE_API_KEY", "pinecone_api_key")
-    index_name = get_setting("pinecone_index", "cnc-rag")
-    cloud = get_setting("pinecone_cloud", "aws")
-    region = get_setting("pinecone_region", "us-east-1")
-    dimension = int(get_setting("embedding_dimension", "1536") or "1536")
-    metric = get_setting("pinecone_metric", "cosine")
-    if not key or not index_name:
-        return None
-    pc = Pinecone(api_key=key)
-    listed_indexes = pc.list_indexes()
-    if hasattr(listed_indexes, "names"):
-        existing = listed_indexes.names()
-    else:
-        existing = [idx["name"] if isinstance(idx, dict) else getattr(idx, "name", "") for idx in listed_indexes]
-    if index_name not in existing:
-        pc.create_index(
-            name=index_name,
-            dimension=dimension,
-            metric=metric,
-            spec=ServerlessSpec(cloud=cloud, region=region),
-        )
-        time.sleep(4)
-    return pc.Index(index_name)
-
-
-def init_firebase():
-    if firebase_admin is None:
-        return None
-    raw = effective_secret("FIREBASE_SERVICE_ACCOUNT_JSON", "firebase_service_account_json")
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        app_name = "cnc-rag-firebase"
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(data)
-            firebase_admin.initialize_app(cred, name=app_name)
-        app = firebase_admin.get_app(app_name) if app_name in firebase_admin._apps else firebase_admin.get_app()
-        return firestore.client(app=app)
-    except Exception as exc:
-        st.warning(f"Firebase مش متوصل: {exc}")
-        return None
-
-
-def list_local_users() -> List[Dict[str, Any]]:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT * FROM users ORDER BY role, name").fetchall()
-    return [dict(r) for r in rows]
-
-
-def upsert_local_user(user: Dict[str, Any]) -> None:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute(
-            """
-            INSERT INTO users(id, name, pin, role, can_chat, can_upload, can_settings, can_users)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name, pin=excluded.pin, role=excluded.role,
-            can_chat=excluded.can_chat, can_upload=excluded.can_upload,
-            can_settings=excluded.can_settings, can_users=excluded.can_users
-            """,
-            (
-                user["id"],
-                user["name"],
-                user["pin"],
-                user["role"],
-                int(user.get("can_chat", True)),
-                int(user.get("can_upload", False)),
-                int(user.get("can_settings", False)),
-                int(user.get("can_users", False)),
-            ),
-        )
-        con.commit()
-
-
-def delete_local_user(user_id: str) -> None:
-    if user_id == "admin":
-        return
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute("DELETE FROM users WHERE id=?", (user_id,))
-        con.commit()
-
-
-def authenticate(user_id: str, pin: str) -> Optional[Dict[str, Any]]:
-    db = init_firebase()
-    if db:
-        doc = db.collection("users").document(user_id).get()
-        if doc.exists:
-            data = doc.to_dict()
-            if str(data.get("pin")) == str(pin):
-                return {"id": user_id, **data}
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.row_factory = sqlite3.Row
-        row = con.execute("SELECT * FROM users WHERE id=? AND pin=?", (user_id, pin)).fetchone()
-    return dict(row) if row else None
-
-
-def can(permission: str) -> bool:
-    user = st.session_state.get("user") or {}
-    if user.get("role") == "admin":
-        return True
-    return bool(user.get(permission))
-
-
-def extract_text(uploaded_file) -> str:
-    suffix = Path(uploaded_file.name).suffix.lower()
-    raw = uploaded_file.getvalue()
-    if suffix in {".txt", ".md", ".log", ".nc", ".gcode", ".json", ".xml"}:
-        return raw.decode("utf-8", errors="ignore")
-    if suffix in {".html", ".htm"}:
-        return BeautifulSoup(raw.decode("utf-8", errors="ignore"), "html.parser").get_text("\n")
-    if suffix == ".pdf":
-        if PdfReader is None:
-            raise RuntimeError("ثبت pypdf لقراءة ملفات PDF")
-        reader = PdfReader(io.BytesIO(raw))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    if suffix in {".docx", ".doc"}:
-        if docx2txt is None:
-            raise RuntimeError("ثبت docx2txt لقراءة ملفات Word")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        try:
-            return docx2txt.process(tmp_path) or ""
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-    if suffix in {".csv"}:
-        return pd.read_csv(io.BytesIO(raw)).to_csv(index=False)
-    if suffix in {".xlsx", ".xls"}:
-        sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None)
-        return "\n\n".join(f"Sheet: {name}\n{df.to_csv(index=False)}" for name, df in sheets.items())
-    return raw.decode("utf-8", errors="ignore")
-
-
-def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 180) -> List[str]:
-    clean = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    chunks = []
-    start = 0
-    while start < len(clean):
-        end = min(start + chunk_size, len(clean))
-        chunks.append(clean[start:end])
-        start = max(end - overlap, end) if end == len(clean) else end - overlap
-    return [c for c in chunks if len(c.strip()) > 30]
-
-
-def embed_texts(client: OpenAI, texts: List[str]) -> List[List[float]]:
-    model = get_setting("embedding_model", "text-embedding-3-small")
-    response = client.embeddings.create(model=model, input=texts)
-    return [item.embedding for item in response.data]
-
-
-def save_file_record(file_id: str, filename: str, namespace: str, chunks: int, user_id: str) -> None:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute(
-            "INSERT OR REPLACE INTO files(id, filename, namespace, chunks, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (file_id, filename, namespace, chunks, user_id, datetime.utcnow().isoformat()),
-        )
-        con.commit()
-
-
-def list_files() -> List[Dict[str, Any]]:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute("SELECT * FROM files ORDER BY created_at DESC").fetchall()
-    return [dict(r) for r in rows]
-
-
-def delete_file_record(file_id: str) -> None:
-    with sqlite3.connect(LOCAL_DB) as con:
-        con.execute("DELETE FROM files WHERE id=?", (file_id,))
-        con.commit()
-
-
-def index_uploaded_file(uploaded_file, namespace: str, user_id: str) -> Tuple[str, int]:
-    client = get_openai_client()
-    index = get_pinecone_index()
-    if not client:
-        raise RuntimeError("حط OpenAI API key في الإعدادات الأول")
-    if index is None:
-        raise RuntimeError("حط Pinecone API key واسم index في الإعدادات الأول")
-    file_id = str(uuid.uuid4())
-    text = extract_text(uploaded_file)
-    chunks = chunk_text(text)
-    if not chunks:
-        raise RuntimeError("الملف ماطلعش منه نص قابل للفهرسة")
-    vectors = []
-    batch_size = 64
-    for batch_start in range(0, len(chunks), batch_size):
-        batch = chunks[batch_start : batch_start + batch_size]
-        embeddings = embed_texts(client, batch)
-        for offset, (chunk, vector) in enumerate(zip(batch, embeddings)):
-            chunk_no = batch_start + offset
-            vectors.append(
-                {
-                    "id": f"{file_id}-{chunk_no}",
-                    "values": vector,
-                    "metadata": {
-                        "file_id": file_id,
-                        "filename": uploaded_file.name,
-                        "chunk": chunk_no,
-                        "text": chunk[:4000],
-                    },
-                }
-            )
-    for batch_start in range(0, len(vectors), 100):
-        index.upsert(vectors=vectors[batch_start : batch_start + 100], namespace=namespace)
-    (UPLOAD_DIR / f"{file_id}_{uploaded_file.name}").write_bytes(uploaded_file.getvalue())
-    save_file_record(file_id, uploaded_file.name, namespace, len(chunks), user_id)
-    return file_id, len(chunks)
-
-
-def delete_indexed_file(file_id: str, namespace: str) -> None:
-    index = get_pinecone_index()
-    if index is not None:
-        index.delete(filter={"file_id": {"$eq": file_id}}, namespace=namespace)
-    for path in UPLOAD_DIR.glob(f"{file_id}_*"):
-        path.unlink(missing_ok=True)
-    delete_file_record(file_id)
-
-
-def retrieve_context(question: str, namespace: str, top_k: int) -> Tuple[str, List[Dict[str, Any]]]:
-    client = get_openai_client()
-    index = get_pinecone_index()
-    if not client or index is None:
-        return "", []
-    vector = embed_texts(client, [question])[0]
-    result = index.query(vector=vector, top_k=top_k, namespace=namespace, include_metadata=True)
-    matches = result.get("matches", []) if isinstance(result, dict) else result.matches
-    sources = []
-    blocks = []
-    for match in matches:
-        meta = match.get("metadata", {}) if isinstance(match, dict) else match.metadata
-        score = match.get("score", 0) if isinstance(match, dict) else match.score
-        text = meta.get("text", "")
-        filename = meta.get("filename", "ملف")
-        if text:
-            blocks.append(f"المصدر: {filename}\n{text}")
-            sources.append({"filename": filename, "score": score, "file_id": meta.get("file_id")})
-    return "\n\n---\n\n".join(blocks), sources
-
-
-def ask_llm(question: str, namespace: str) -> Tuple[str, List[Dict[str, Any]]]:
-    client = get_openai_client()
-    if not client:
-        return "لسه مفتاح OpenAI مش متسجل. افتح الإعدادات وحطه الأول.", []
-    top_k = int(get_setting("top_k", "5") or "5")
-    context, sources = retrieve_context(question, namespace, top_k)
-    prompt = f"""
-سؤال العامل:
-{question}
-
-معلومات الشركة المسترجعة من الملفات:
-{context or "لا توجد ملفات مسترجعة أو Pinecone غير متصل."}
-
-اكتب إجابة عملية بالمصري الصنايعي. خليها مرقمة:
-1. التشخيص الأقرب
-2. خطوات الفحص
-3. الحل
-4. السلامة
-5. محتاج أعرف إيه لو العطل لسه موجود
-"""
-    model = get_setting("llm_model", "gpt-5.4-mini")
-    response = client.responses.create(
-        model=model,
-        instructions=get_setting("system_prompt", DEFAULT_SYSTEM_PROMPT),
-        input=prompt,
-    )
-    answer = getattr(response, "output_text", "") or str(response)
-    return answer, sources
-
-
-def speech_to_text(audio_bytes: bytes) -> str:
-    client = get_openai_client()
-    if not client:
-        return ""
-    model = get_setting("stt_model", "gpt-4o-mini-transcribe")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-    try:
-        with open(tmp_path, "rb") as fh:
-            transcript = client.audio.transcriptions.create(model=model, file=fh, language="ar")
-        return getattr(transcript, "text", "") or str(transcript)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-
-def text_to_speech(text: str) -> Optional[bytes]:
-    client = get_openai_client()
-    if not client:
-        return None
-    model = get_setting("tts_model", "gpt-4o-mini-tts")
-    voice = get_setting("tts_voice", "ash")
-    response = client.audio.speech.create(
-        model=model,
-        voice=voice,
-        input=text[:3500],
-        instructions="اتكلم بلهجة مصرية صنايعي ودودة وواضحة، سرعة متوسطة، من غير فصحى تقيلة.",
-    )
-    return response.read()
-
-
-def render_hero() -> None:
-    st.markdown(
-        """
-        <div class="hero">
-          <small>CNC • COMPRESSORS • FIELD RAG</small>
-          <h1>مساعد الورشة الذكي بالصوت</h1>
-          <div class="caption">تشخيص أعطال، تعليمات صيانة، ورفع معرفة الشركة للعامل بلغة بسيطة وصوت واضح.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def login_view() -> None:
-    render_hero()
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("دخول")
-    user_id = st.text_input("كود العامل أو المدير", value="admin")
-    pin = st.text_input("PIN", type="password", value="")
-    if st.button("دخول", use_container_width=True):
-        user = authenticate(user_id.strip(), pin.strip())
-        if user:
-            st.session_state.user = user
-            st.rerun()
-        st.error("الكود أو PIN غلط")
-    st.caption("أول تشغيل: admin / 1234، غيره من صفحة المستخدمين.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def sidebar_nav() -> str:
-    user = st.session_state.get("user", {})
-    st.sidebar.markdown(f"### {user.get('name', 'مستخدم')}")
-    st.sidebar.caption(f"الدور: {user.get('role', 'worker')}")
-    pages = []
-    if can("can_chat"):
-        pages.append("الشات الصوتي")
-    if can("can_upload"):
-        pages.append("رفع الداتا")
-    if can("can_settings"):
-        pages.append("الإعدادات")
-    if can("can_users"):
-        pages.append("المستخدمين")
-    choice = st.sidebar.radio("النوافذ", pages, label_visibility="collapsed")
     if st.sidebar.button("خروج", use_container_width=True):
-        st.session_state.clear()
+        st.session_state.user = None
+        st.session_state.session_id = None
         st.rerun()
-    return choice
+
+    return tenant
 
 
-def render_metrics() -> None:
-    files = list_files()
-    chunks = sum(int(f["chunks"]) for f in files)
-    st.markdown(
-        f"""
-        <div class="metric-grid">
-          <div class="metric-tile"><b>{len(files)}</b><span>ملفات معرفة</span></div>
-          <div class="metric-tile"><b>{chunks}</b><span>قطع مفهرسة</span></div>
-          <div class="metric-tile"><b>{get_setting("pinecone_index", "cnc-rag")}</b><span>Pinecone index</span></div>
-          <div class="metric-tile"><b>{get_setting("llm_model", "gpt-5.4-mini")}</b><span>موديل الرد</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def chat_page(db, tenant):
+    user = st.session_state.user
+    session = get_or_create_session(db, tenant["id"], user["id"], st.session_state.session_id)
+    st.session_state.session_id = session["id"]
 
+    st.header("المساعد الفني")
+    st.caption("اسأل عن عطل، ارفع صورة، أو استخدم الصوت لو متاح في Streamlit عندك.")
 
-def chat_page() -> None:
-    render_hero()
-    render_metrics()
-    namespace = get_setting("pinecone_namespace", "factory")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    for msg in load_messages(db, session["id"]):
+        role = "assistant" if msg["role"] == "AI" else "user"
+        with st.chat_message(role):
+            st.write(msg["content"])
 
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("اتكلم أو اكتب المشكلة")
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        audio = mic_recorder(
-            start_prompt="سجل المشكلة",
-            stop_prompt="وقف التسجيل",
-            just_once=True,
-            use_container_width=True,
-            key="voice_recorder",
-        )
-    with col2:
-        question = st.text_area("اكتب المشكلة لو مش هتسجل صوت", height=118, placeholder="مثال: الكومبروسر بيفصل overload بعد عشر دقايق...")
-
-    spoken_text = ""
-    if audio and audio.get("bytes"):
-        with st.spinner("بفك التسجيل العربي..."):
-            spoken_text = speech_to_text(audio["bytes"])
-        if spoken_text:
-            st.info(f"النص اللي اتسمع: {spoken_text}")
-            question = spoken_text
-
-    submit = st.button("اسأل المساعد", use_container_width=True)
-    if submit and question.strip():
-        st.session_state.messages.append({"role": "user", "text": question.strip()})
-        with st.spinner("براجع ملفات الشركة وبجهز رد عملي..."):
-            answer, sources = ask_llm(question.strip(), namespace)
-        st.session_state.messages.append({"role": "assistant", "text": answer, "sources": sources})
-        if get_setting("auto_tts", "1") == "1":
-            try:
-                audio_bytes = text_to_speech(answer)
-                if audio_bytes:
-                    st.audio(audio_bytes, format="audio/mp3")
-            except Exception as exc:
-                st.warning(f"الرد الصوتي تعطل: {exc}")
-
-    for msg in st.session_state.messages[-10:]:
-        klass = "chat-user" if msg["role"] == "user" else "chat-ai"
-        label = "العامل" if msg["role"] == "user" else "المساعد"
-        st.markdown(f'<div class="{klass}"><b>{label}</b><br>{msg["text"]}</div>', unsafe_allow_html=True)
-        if msg.get("sources"):
-            chips = "".join(
-                f'<span class="source-chip">{s["filename"]} • {float(s.get("score", 0)):.2f}</span>'
-                for s in msg["sources"]
-            )
-            st.markdown(chips, unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def upload_page() -> None:
-    render_hero()
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("رفع ملفات المعرفة")
-    namespace = st.text_input("Namespace", value=get_setting("pinecone_namespace", "factory"))
-    files = st.file_uploader(
-        "ارفع PDF / Word / Excel / CSV / TXT / HTML / NC / G-code",
-        accept_multiple_files=True,
-        type=["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt", "md", "html", "htm", "log", "nc", "gcode", "json", "xml"],
-    )
-    if st.button("فهرسة الملفات", use_container_width=True, disabled=not files):
-        set_setting("pinecone_namespace", namespace)
-        for f in files:
-            with st.spinner(f"بفهرس {f.name}..."):
-                try:
-                    file_id, chunks = index_uploaded_file(f, namespace, st.session_state.user["id"])
-                    st.success(f"تم رفع {f.name}: {chunks} جزء")
-                except Exception as exc:
-                    st.error(f"{f.name}: {exc}")
-
-    st.divider()
-    st.subheader("الملفات الحالية")
-    rows = list_files()
-    if rows:
-        for row in rows:
-            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-            c1.write(row["filename"])
-            c2.write(f'{row["chunks"]} جزء')
-            c3.write(row["namespace"])
-            if c4.button("حذف", key=f"del_{row['id']}"):
-                try:
-                    delete_indexed_file(row["id"], row["namespace"])
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"الحذف تعطل: {exc}")
-    else:
-        st.info("لسه مفيش ملفات مرفوعة.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def settings_page() -> None:
-    render_hero()
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("الإعدادات والربط")
-    with st.form("settings"):
-        openai_key = st.text_input("OpenAI API Key", value=get_setting("openai_api_key", ""), type="password")
-        pinecone_key = st.text_input("Pinecone API Key", value=get_setting("pinecone_api_key", ""), type="password")
-        firebase_json = st.text_area("Firebase service account JSON", value=get_setting("firebase_service_account_json", ""), height=120)
-        c1, c2, c3 = st.columns(3)
-        llm_model = c1.text_input("LLM model", value=get_setting("llm_model", "gpt-5.4-mini"))
-        embedding_model = c2.text_input("Embedding model", value=get_setting("embedding_model", "text-embedding-3-small"))
-        embedding_dimension = c3.text_input("Embedding dimension", value=get_setting("embedding_dimension", "1536"))
-        c4, c5, c6 = st.columns(3)
-        stt_model = c4.text_input("Speech-to-text model", value=get_setting("stt_model", "gpt-4o-mini-transcribe"))
-        tts_model = c5.text_input("Text-to-speech model", value=get_setting("tts_model", "gpt-4o-mini-tts"))
-        tts_voice = c6.text_input("Voice", value=get_setting("tts_voice", "ash"))
-        c7, c8, c9 = st.columns(3)
-        pinecone_index = c7.text_input("Pinecone index", value=get_setting("pinecone_index", "cnc-rag"))
-        pinecone_cloud = c8.text_input("Cloud", value=get_setting("pinecone_cloud", "aws"))
-        pinecone_region = c9.text_input("Region", value=get_setting("pinecone_region", "us-east-1"))
-        namespace = st.text_input("Default namespace", value=get_setting("pinecone_namespace", "factory"))
-        top_k = st.slider("عدد المصادر المسترجعة", min_value=1, max_value=12, value=int(get_setting("top_k", "5") or "5"))
-        auto_tts = st.checkbox("تشغيل الرد الصوتي تلقائي", value=get_setting("auto_tts", "1") == "1")
-        system_prompt = st.text_area("شخصية وتعليمات المساعد", value=get_setting("system_prompt", DEFAULT_SYSTEM_PROMPT), height=190)
-        saved = st.form_submit_button("حفظ الإعدادات", use_container_width=True)
-    if saved:
-        pairs = {
-            "openai_api_key": openai_key,
-            "pinecone_api_key": pinecone_key,
-            "firebase_service_account_json": firebase_json,
-            "llm_model": llm_model,
-            "embedding_model": embedding_model,
-            "embedding_dimension": embedding_dimension,
-            "stt_model": stt_model,
-            "tts_model": tts_model,
-            "tts_voice": tts_voice,
-            "pinecone_index": pinecone_index,
-            "pinecone_cloud": pinecone_cloud,
-            "pinecone_region": pinecone_region,
-            "pinecone_namespace": namespace,
-            "top_k": str(top_k),
-            "auto_tts": "1" if auto_tts else "0",
-            "system_prompt": system_prompt,
-        }
-        for key, value in pairs.items():
-            set_setting(key, value)
-        st.success("اتحفظت.")
-
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.markdown(f'OpenAI: <span class="{"status-ok" if get_openai_client() else "status-bad"}">{"متوصل" if get_openai_client() else "ناقص"}</span>', unsafe_allow_html=True)
-    c2.markdown(f'Pinecone: <span class="{"status-ok" if effective_secret("PINECONE_API_KEY", "pinecone_api_key") else "status-bad"}">{"مفتاح موجود" if effective_secret("PINECONE_API_KEY", "pinecone_api_key") else "ناقص"}</span>', unsafe_allow_html=True)
-    c3.markdown(f'Firebase: <span class="{"status-ok" if get_setting("firebase_service_account_json", "") else "status-bad"}">{"مجهز" if get_setting("firebase_service_account_json", "") else "اختياري"}</span>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def users_page() -> None:
-    render_hero()
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.subheader("إدارة العمال والصلاحيات")
-    with st.form("user_form"):
-        c1, c2, c3, c4 = st.columns(4)
-        user_id = c1.text_input("كود المستخدم")
-        name = c2.text_input("الاسم")
-        pin = c3.text_input("PIN", type="password")
-        role = c4.selectbox("الدور", ["worker", "supervisor", "admin"])
-        p1, p2, p3, p4 = st.columns(4)
-        can_chat = p1.checkbox("الشات", value=True)
-        can_upload = p2.checkbox("رفع الداتا")
-        can_settings = p3.checkbox("الإعدادات")
-        can_users = p4.checkbox("المستخدمين")
-        add = st.form_submit_button("حفظ المستخدم", use_container_width=True)
-    if add:
-        if user_id and name and pin:
-            user = {
-                "id": user_id.strip(),
-                "name": name.strip(),
-                "pin": pin.strip(),
-                "role": role,
-                "can_chat": can_chat,
-                "can_upload": can_upload,
-                "can_settings": can_settings,
-                "can_users": can_users,
-            }
-            upsert_local_user(user)
-            db = init_firebase()
-            if db:
-                db.collection("users").document(user["id"]).set(user)
-            st.success("اتحفظ.")
+    cols = st.columns([2, 1])
+    with cols[0]:
+        image_file = st.file_uploader("صورة من الورشة", type=["png", "jpg", "jpeg", "webp"])
+    with cols[1]:
+        audio_file = None
+        if hasattr(st, "audio_input"):
+            audio_file = st.audio_input("رسالة صوتية")
         else:
-            st.error("الكود والاسم والـ PIN مطلوبين.")
+            st.info("نسخة Streamlit الحالية لا تدعم st.audio_input.")
 
-    rows = list_local_users()
-    st.dataframe(pd.DataFrame(rows).drop(columns=["pin"], errors="ignore"), use_container_width=True, hide_index=True)
-    delete_id = st.selectbox("حذف مستخدم", [r["id"] for r in rows if r["id"] != "admin"])
-    if st.button("حذف المستخدم", use_container_width=True, disabled=not delete_id):
-        delete_local_user(delete_id)
-        db = init_firebase()
-        if db:
-            db.collection("users").document(delete_id).delete()
+    prompt = st.chat_input("اكتب المشكلة هنا يا هندسة")
+    if not prompt and audio_file:
+        openai_key = decrypt_val(tenant.get("openai_api_key", ""))
+        if openai_key:
+            with st.spinner("بفك الرسالة الصوتية..."):
+                prompt = transcribe_audio(openai_key, audio_file.getvalue(), ".wav")
+        else:
+            st.error("الصوت يحتاج مفتاح OpenAI للتفريغ.")
+
+    if prompt or image_file:
+        image_url = image_to_data_url(image_file)
+        message = prompt or "بص على الصورة دي وقولي الحل إيه؟"
+        rename_session_from_message(db, session["id"], session["title"], message)
+        save_message(db, tenant["id"], session["id"], "Worker", message)
+
+        with st.chat_message("user"):
+            st.write(message)
+            if image_file:
+                st.image(image_file)
+
+        with st.chat_message("assistant"):
+            try:
+                context = rag_context(tenant, message)
+                system_prompt = f"{tenant.get('workshop_prompt') or DEFAULT_PROMPT}\n\n"
+                system_prompt += f"تاريخ المحادثة السابقة:\n{history_text(db, session['id'], 6)}\n\n"
+                system_prompt += f"معلومات فنية من الكتالوجات:\n{context}"
+                chunks: List[str] = []
+
+                def generator():
+                    for part in stream_llm(tenant, system_prompt, message, image_url):
+                        chunks.append(part)
+                        yield part
+
+                st.write_stream(generator())
+                answer = "".join(chunks)
+                st.session_state.last_answer = answer
+                save_message(db, tenant["id"], session["id"], "AI", answer)
+            except Exception as exc:
+                st.error(f"حصل عطل في الرد: {exc}")
+
+    if st.session_state.last_answer:
+        if st.button("اسمع آخر رد"):
+            try:
+                audio = generate_tts(tenant, st.session_state.last_answer)
+                st.audio(audio, format="audio/mp3")
+            except Exception as exc:
+                st.error(f"تعذر توليد الصوت: {exc}")
+
+
+def documents_page(db, tenant):
+    st.header("كتالوجات الورشة")
+    st.caption("ارفع ملفات PDF ليتم تخزينها في Pinecone وربطها بإجابات الشات.")
+
+    uploaded = st.file_uploader("PDF", type=["pdf"], accept_multiple_files=True)
+    if uploaded and st.button("رفع وفهرسة", use_container_width=True):
+        for file in uploaded:
+            with st.spinner(f"بفهرس {file.name}..."):
+                try:
+                    chunks, _ = upsert_document_to_pinecone(db, tenant, file.name, file.getvalue())
+                    st.success(f"تم فهرسة {file.name} بعدد {chunks} جزء.")
+                except Exception as exc:
+                    st.error(f"{file.name}: {exc}")
+
+    st.subheader("الملفات المرفوعة")
+    docs = list_documents(db, tenant["id"])
+    if not docs:
+        st.info("لا توجد كتالوجات حتى الآن.")
+    for doc in docs:
+        st.write(f"- {doc['filename']} ({doc.get('chunks', 0)} جزء)")
+
+
+def alerts_page(db, tenant):
+    st.header("التنبيهات")
+    if st.button("حلل آخر 30 يوم", use_container_width=True):
+        with st.spinner("بحلل المحادثات..."):
+            result = analyze_machine_issues(db, tenant)
+            if result:
+                st.success(result)
+            else:
+                st.info("لا يوجد تكرار واضح أو مفتاح OpenAI غير متاح.")
+
+    alerts = list_alerts(db, tenant["id"])
+    if not alerts:
+        st.info("لا توجد تنبيهات.")
+    for alert in alerts:
+        st.warning(alert["message"])
+
+
+def settings_page(db, tenant):
+    st.header("الإعدادات")
+    with st.form("settings"):
+        name = st.text_input("اسم الورشة", value=tenant.get("name", ""))
+        provider = st.selectbox(
+            "مزود الذكاء الاصطناعي",
+            ["openai", "google", "anthropic", "custom"],
+            index=["openai", "google", "anthropic", "custom"].index(tenant.get("llm_provider", "openai")),
+        )
+        model = st.text_input("الموديل", value=tenant.get("llm_model", "gpt-4o-mini"))
+        api_base_url = st.text_input("Base URL اختياري", value=tenant.get("api_base_url", ""))
+        openai_key = st.text_input("OpenAI API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
+        google_key = st.text_input("Google API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
+        anthropic_key = st.text_input("Anthropic API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
+        pinecone_key = st.text_input("Pinecone API Key", type="password", placeholder="اتركه فارغا للاحتفاظ بالموجود")
+        pinecone_index = st.text_input("Pinecone Index", value=tenant.get("pinecone_index", ""))
+        workshop_prompt = st.text_area("Prompt الورشة", value=tenant.get("workshop_prompt", DEFAULT_PROMPT), height=240)
+        submitted = st.form_submit_button("حفظ", use_container_width=True)
+
+    if submitted:
+        data = {
+            "name": name,
+            "llm_provider": provider,
+            "llm_model": model,
+            "api_base_url": api_base_url,
+            "pinecone_index": pinecone_index,
+            "workshop_prompt": workshop_prompt,
+        }
+        if openai_key:
+            data["openai_api_key"] = openai_key
+        if google_key:
+            data["google_api_key"] = google_key
+        if anthropic_key:
+            data["anthropic_api_key"] = anthropic_key
+        if pinecone_key:
+            data["pinecone_api_key"] = pinecone_key
+        save_tenant_settings(db, tenant["id"], data)
+        st.success("تم حفظ الإعدادات.")
         st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def main() -> None:
-    init_local_db()
-    inject_css()
-    if "user" not in st.session_state:
-        login_view()
+def main():
+    init_state()
+    try:
+        db = get_db()
+        ensure_seed_data(db)
+    except Exception as exc:
+        st.error(f"تعذر الاتصال بـ Firebase: {exc}")
+        st.stop()
+
+    if not st.session_state.user:
+        login_view(db)
         return
-    page = sidebar_nav()
-    if page == "الشات الصوتي":
-        chat_page()
-    elif page == "رفع الداتا":
-        upload_page()
-    elif page == "الإعدادات":
-        settings_page()
-    elif page == "المستخدمين":
-        users_page()
+
+    tenant = sidebar(db)
+    if st.session_state.user["role"] == "admin":
+        tab_chat, tab_docs, tab_alerts, tab_settings = st.tabs(["الشات", "الكتالوجات", "التنبيهات", "الإعدادات"])
+        with tab_chat:
+            chat_page(db, tenant)
+        with tab_docs:
+            documents_page(db, tenant)
+        with tab_alerts:
+            alerts_page(db, tenant)
+        with tab_settings:
+            settings_page(db, tenant)
+    else:
+        chat_page(db, tenant)
 
 
 if __name__ == "__main__":
