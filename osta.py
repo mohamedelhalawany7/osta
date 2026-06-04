@@ -450,7 +450,17 @@ def render_login_page():
                         if users_ref:
                             user_data = users_ref[0].to_dict()
                             stored_hash = user_data.get("password", "")
-                            if bcrypt.checkpw(password.encode(), stored_hash.encode()):
+                            
+                            is_valid = False
+                            if stored_hash:
+                                try:
+                                    # التحقق الآمن من صيغة الهاش في bcrypt
+                                    is_valid = bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
+                                except ValueError:
+                                    # معالجة الخطأ إذا كانت الكلمة مسجلة كنص عادي أو بتنسيق غير مدعوم
+                                    is_valid = (password == stored_hash)
+                                    
+                            if is_valid:
                                 st.session_state.current_user = {"id": users_ref[0].id, **user_data}
                                 st.rerun()
                             else:
