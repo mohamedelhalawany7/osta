@@ -1,13 +1,12 @@
 streamlit
-   firebase-admin
-   bcrypt
-   cryptography
-   langchain
-   langchain-openai
-   langchain-anthropic
-   langchain-google-genai
-   langchain-pinecone
-   pinecone-client
-   pypdf
-   openai
-   apscheduler
+firebase-admin
+bcrypt
+cryptography
+openai
+pinecone-client>=5.0.0
+pypdf
+langchain-openai
+langchain-anthropic
+langchain-google-genai
+langchain-pinecone
+langchain-text-splitters
