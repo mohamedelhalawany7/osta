@@ -62,14 +62,58 @@ def utc_now() -> datetime:
 
 
 @st.cache_resource
+def parse_firebase_credentials(raw: str) -> dict:
+    raw = (raw or "").strip()
+    if not raw:
+        raise RuntimeError("FIREBASE_CREDENTIALS is missing.")
+
+    if os.path.exists(raw):
+        with open(raw, "r", encoding="utf-8") as cred_file:
+            return json.load(cred_file)
+
+    candidates = [raw]
+    if '"private_key"' in raw:
+        prefix, sep, suffix = raw.partition('"private_key"')
+        key_name, colon, rest = suffix.partition(":")
+        first_quote = rest.find('"')
+        end_marker = rest.find('",', first_quote + 1)
+        if end_marker == -1:
+            end_marker = rest.find('"\n}', first_quote + 1)
+        if first_quote != -1 and end_marker != -1:
+            key_value = rest[first_quote + 1 : end_marker]
+            fixed_value = key_value.replace("\r\n", "\\n").replace("\n", "\\n")
+            fixed_rest = rest[: first_quote + 1] + fixed_value + rest[end_marker:]
+            candidates.append(prefix + sep + key_name + colon + fixed_rest)
+
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        candidates.append(decoded)
+    except Exception:
+        pass
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and "private_key" in data:
+                data["private_key"] = data["private_key"].replace("\\n", "\n")
+            return data
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "FIREBASE_CREDENTIALS must be valid JSON, base64 JSON, or a path to the service-account JSON file. "
+        f"Parser error: {last_error}"
+    )
+
+
+@st.cache_resource
 def get_db():
     raw = os.getenv("FIREBASE_CREDENTIALS", "")
     if not raw:
         raw = st.secrets.get("FIREBASE_CREDENTIALS", "") if hasattr(st, "secrets") else ""
-    if not raw:
-        raise RuntimeError("FIREBASE_CREDENTIALS is missing.")
 
-    cred_dict = json.loads(raw)
+    cred_dict = parse_firebase_credentials(raw)
     if not firebase_admin._apps:
         firebase_admin.initialize_app(credentials.Certificate(cred_dict))
     return firestore.client()
