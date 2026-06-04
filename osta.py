@@ -2217,13 +2217,10 @@ if __name__ == "__main__":
                 except Exception as e:
                     logger.error(f"Failed to start backend server: {e}")
 
-            with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
+            with st.spinner("🚀 جاري تهيئة بيئة العمل الأساسية..."):
                 t = threading.Thread(target=run_server, daemon=True)
                 t.start()
-                for _ in range(10):
-                    if is_server_running():
-                        break
-                    time.sleep(0.5)
+                # ❌ تم الحذف الجراحي لحلقة (time.sleep) التي كانت تسبب تجميد السيرفر و Connection Refused
         st.session_state.server_started = True
 
     API_BASE = "http://127.0.0.1:8000"
