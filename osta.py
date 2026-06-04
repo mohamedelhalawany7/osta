@@ -26,7 +26,7 @@ import streamlit as st
 import requests
 
 import mimetypes
-import filetype
+# حذفنا filetype عشان ما تعملش مشاكل
 
 import uvicorn
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, HTTPException, status, BackgroundTasks, Response
@@ -470,15 +470,18 @@ async def lifespan(app: FastAPI):
                 pc_client_instance = PineconeClient(api_key=pk)
                 logger.info("Pinecone Client Initialized (Singleton).")
 
-    scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
+    if not scheduler.get_jobs():
+        scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
+        scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
+        scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
     
-    # --- إضافة مهام Firebase المجدولة ---
-    scheduler.add_job(flush_write_buffer, 'interval', minutes=2)
-    scheduler.add_job(cleanup_old_firestore_data, 'cron', hour=3, minute=0)
-    
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
+        
     yield
-    scheduler.shutdown()
+    
+    if scheduler.running:
+        scheduler.shutdown()
     
     # تفريغ قاعدة البيانات عند إغلاق التطبيق
     try:
@@ -1455,19 +1458,11 @@ async def upload_rag_api(request: Request, background_tasks: BackgroundTasks, fi
                 
             content = await file.read()
             if len(content) > MAX_FILE_SIZE: return RedirectResponse(url="/data_management?msg=error_size", status_code=303)
-            try:
-                kind = filetype.guess(content)
-                if kind:
-                    mime_type = kind.mime
-                else:
-                    mime_type, _ = mimetypes.guess_type(file.filename)
-                    if not mime_type: mime_type = "application/octet-stream"
-                
-                if mime_type not in ["application/pdf", "text/plain"]: 
-                    return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
-            except Exception:
-                if not (file.filename.lower().endswith('.pdf') or file.filename.lower().endswith('.txt')):
-                     return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
+            
+            # استنتاج نوع الملف باستخدام امتداده بدل filetype اللي بتعمل مشاكل
+            filename_lower = file.filename.lower()
+            if not (filename_lower.endswith('.pdf') or filename_lower.endswith('.txt')):
+                return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
 
             new_doc = UploadedDocument(filename=file.filename, tenant_id=user.tenant_id)
             db.add(new_doc)
@@ -2190,14 +2185,25 @@ async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSessi
 # =====================================================================
 # واجهة Streamlit السحرية (تم دمج واجهة الكشك الأصلية هنا بالكامل)
 # =====================================================================
+
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+    if not get_script_run_ctx():
+        logger.info("Pre-flight check detected. Exiting gracefully to allow Streamlit to start.")
+        import sys
+        sys.exit(0)
+except ImportError:
+    pass
+
 st.set_page_config(page_title="مساعد الورشة الذكي", page_icon="🔧", layout="wide", initial_sidebar_state="expanded")
 
 def is_server_running(port=8000):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('127.0.0.1', port)) == 0
 
-if "server_started" not in st.session_state:
-    if not is_server_running():
+@st.cache_resource
+def start_backend_server():
+    if not is_server_running(8000):
         def run_server():
             try:
                 config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
@@ -2208,14 +2214,16 @@ if "server_started" not in st.session_state:
             except Exception as e:
                 logger.error(f"Failed to start backend server: {e}")
 
-        with st.spinner("🚀 جاري تشغيل خادم الذكاء الاصطناعي الأساسي في الخلفية..."):
-            t = threading.Thread(target=run_server, daemon=True)
-            t.start()
-            for _ in range(10):
-                if is_server_running():
-                    break
-                time.sleep(0.5)
-    st.session_state.server_started = True
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+        for _ in range(15):
+            if is_server_running(8000):
+                break
+            time.sleep(0.5)
+    return True
+
+# تشغيل الخادم في الخلفية بأمان
+start_backend_server()
 
 API_BASE = "http://127.0.0.1:8000"
 
