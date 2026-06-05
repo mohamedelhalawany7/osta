@@ -217,13 +217,18 @@ def log_audit(db, tenant_id: str, action: str, performed_by: str, details: str):
     })
 
 def get_chat_history(session_id: str, db, limit: int = 5) -> str:
-    docs = db.collection("conversation_history")\
-             .where("session_id", "==", session_id)\
-             .order_by("created_at", direction=firestore.Query.DESCENDING)\
-             .limit(limit).stream()
-    history = []
+    docs = db.collection("conversation_history").stream()
+    history_docs = []
     for doc in docs:
         d = doc.to_dict()
+        if d.get("session_id") == session_id:
+            history_docs.append(d)
+            
+    history_docs.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    history_docs = history_docs[:limit]
+    
+    history = []
+    for d in history_docs:
         history.append(f"{d.get('role')}: {d.get('content')}")
     if not history: return "لا يوجد تاريخ محادثة سابق."
     return "\n".join(reversed(history))
@@ -237,9 +242,15 @@ def save_chat_history(session_id: str, role: str, content: str, db, tenant_id: s
         "tenant_id": tenant_id
     })
     
-    docs = list(db.collection("conversation_history").where("session_id", "==", session_id).order_by("created_at").stream())
-    if len(docs) > 20:
-        for doc in docs[:len(docs)-20]:
+    docs = list(db.collection("conversation_history").stream())
+    session_docs = []
+    for doc in docs:
+        if doc.to_dict().get("session_id") == session_id:
+            session_docs.append(doc)
+            
+    if len(session_docs) > 20:
+        session_docs.sort(key=lambda x: x.to_dict().get("created_at", datetime.min))
+        for doc in session_docs[:len(session_docs)-20]:
             doc.reference.delete()
 
 class WhatsApp_Manager:
@@ -296,11 +307,12 @@ class WhatsApp_Manager:
 
             await self.send_message(sender_phone, clean_reply)
 
-            team_docs = self.db.collection("team_members").where("tenant_id", "==", self.tenant.id).stream()
+            team_docs = self.db.collection("team_members").stream()
             for doc in team_docs:
                 member = doc.to_dict()
-                alert_msg = f"[تنبيه تحويل آلي 🚨]:\nالعميل ({sender_phone}) جاهز للتدخل البشري.\nملخص الحوار الأخير: {message}\nالرجاء التواصل معه."
-                await self.send_message(member.get("phone"), alert_msg)
+                if member.get("tenant_id") == self.tenant.id:
+                    alert_msg = f"[تنبيه تحويل آلي 🚨]:\nالعميل ({sender_phone}) جاهز للتدخل البشري.\nملخص الحوار الأخير: {message}\nالرجاء التواصل معه."
+                    await self.send_message(member.get("phone"), alert_msg)
 
             return clean_reply
         else:
@@ -337,7 +349,7 @@ def extract_and_save_followup(reply_text: str, partner_phone: str, tenant_id: st
 def init_db():
     if not db_firestore: return
     try:
-        tenants = list(db_firestore.collection("tenants").limit(1).stream())
+        tenants = list(db_firestore.collection("tenants").stream())
         if not tenants:
             print("[النظام]: جاري إنشاء الشركة الافتراضية والمدير (Admin)...")
             tenant_ref = db_firestore.collection("tenants").document()
@@ -364,10 +376,15 @@ def init_db():
             })
             
         else:
-            users = list(db_firestore.collection("users").where("username", "==", "admin").limit(1).stream())
-            if users:
-                user_doc = users[0]
-                user_doc.reference.update({"hashed_password": get_password_hash("12345678")})
+            users = list(db_firestore.collection("users").stream())
+            admin_user = None
+            for doc in users:
+                if doc.to_dict().get("username") == "admin":
+                    admin_user = doc
+                    break
+                    
+            if admin_user:
+                admin_user.reference.update({"hashed_password": get_password_hash("12345678")})
                 print("=====================================================")
                 print("[تنبيه]: تم إعادة تعيين الرقم السري لمدير النظام (admin).")
                 print("Username: admin")
@@ -388,22 +405,17 @@ def get_current_user_from_cookie(request: Request, db = Depends(get_db)):
         username: str = payload.get("sub")
         if not username: return None
         
-        users = list(db.collection("users").where("username", "==", username).limit(1).stream())
-        if not users: return None
-        
-        user_data = users[0].to_dict()
-        user_model = UserModel(users[0].id, user_data)
-        
-        tenant_id = user_data.get("tenant_id")
-        if tenant_id:
-            tenant_doc = db.collection("tenants").document(tenant_id).get()
-            if tenant_doc.exists:
-                user_model.tenant = TenantModel(tenant_doc.id, tenant_doc.to_dict())
+        users = list(db.collection("users").stream())
+        user_doc = None
+        for doc in users:
+            if doc.to_dict().get("username") == username:
+                user_doc = doc
+                break
                 
-        return user_model
-    except JWTError:
-        return None
-
+        if not user_doc: return None
+        
+        user_data = user_doc.to_dict()
+        user_model = UserModel(user_doc.id, user_data)
 def render_html_layout(content: str, title: str, user=None):
     nav_links = ""
     if user:
@@ -706,22 +718,23 @@ async def automated_task_reminders():
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
         
-        tasks_docs = db_firestore.collection("followup_tasks").where("status", "==", "pending").stream()
+        tasks_docs = db_firestore.collection("followup_tasks").stream()
         for t_doc in tasks_docs:
             td = t_doc.to_dict()
-            due_date = td.get("due_date")
-            if due_date:
-                due_date = due_date.replace(tzinfo=None)
-                if today_start <= due_date < today_end:
-                    tenant_id = td.get("tenant_id")
-                    tenant_doc = db_firestore.collection("tenants").document(tenant_id).get()
-                    if tenant_doc.exists:
-                        tenant = TenantModel(tenant_doc.id, tenant_doc.to_dict())
-                        llm = get_llm_client(tenant)
-                        wa_manager = WhatsApp_Manager(tenant, db_firestore, llm)
-                        msg = f"🔔 [تذكير تلقائي للمتابعة]:\nأهلاً بك، نذكرك بأن لديك مهمة مستحقة اليوم:\n- المهمة: {td.get('task_name')}\n- العميل: {td.get('client_name')}\n\nيرجى تحديث الحالة فور الانتهاء."
-                        await wa_manager.send_message(td.get('partner_phone'), msg)
-                        t_doc.reference.update({"status": "reminded"})
+            if td.get("status") == "pending":
+                due_date = td.get("due_date")
+                if due_date:
+                    due_date = due_date.replace(tzinfo=None)
+                    if today_start <= due_date < today_end:
+                        tenant_id = td.get("tenant_id")
+                        tenant_doc = db_firestore.collection("tenants").document(tenant_id).get()
+                        if tenant_doc.exists:
+                            tenant = TenantModel(tenant_doc.id, tenant_doc.to_dict())
+                            llm = get_llm_client(tenant)
+                            wa_manager = WhatsApp_Manager(tenant, db_firestore, llm)
+                            msg = f"🔔 [تذكير تلقائي للمتابعة]:\nأهلاً بك، نذكرك بأن لديك مهمة مستحقة اليوم:\n- المهمة: {td.get('task_name')}\n- العميل: {td.get('client_name')}\n\nيرجى تحديث الحالة فور الانتهاء."
+                            await wa_manager.send_message(td.get('partner_phone'), msg)
+                            t_doc.reference.update({"status": "reminded"})
         logger.info(f"Automated reminders sent successfully.")
     except Exception as e:
         logger.error(f"Task Reminder Error: {e}")
@@ -734,13 +747,13 @@ async def proactive_market_agent():
             tenant_id = t_doc.id
             tenant_data = t_doc.to_dict()
             
-            approvals = db_firestore.collection("approval_queue").where("tenant_id", "==", tenant_id).stream()
+            approvals = db_firestore.collection("approval_queue").stream()
             old_pending = 0
             two_days_ago = datetime.utcnow() - timedelta(days=2)
             
             for app_doc in approvals:
                 ad = app_doc.to_dict()
-                if ad.get("status") == "pending":
+                if ad.get("tenant_id") == tenant_id and ad.get("status") == "pending":
                     created_at = ad.get("created_at")
                     if created_at and created_at.replace(tzinfo=None) < two_days_ago:
                         old_pending += 1
@@ -750,11 +763,12 @@ async def proactive_market_agent():
                 llm = get_llm_client(tenant)
                 if llm:
                     wa_manager = WhatsApp_Manager(tenant, db_firestore, llm)
-                    admins = db_firestore.collection("team_members").where("tenant_id", "==", tenant_id).where("role", "==", "admin").stream()
+                    admins = db_firestore.collection("team_members").stream()
                     for admin_doc in admins:
                         admin = admin_doc.to_dict()
-                        alert_msg = f"🤖 [تقرير الوكيل الاستباقي]:\nمرحباً، لاحظت وجود ({old_pending}) طلبات تسعير معلقة في صندوق المراجعة منذ أكثر من يومين. هل ترغب في الموافقة عليها الآن لتسريع دورة المشتريات؟"
-                        await wa_manager.send_message(admin.get("phone"), alert_msg)
+                        if admin.get("tenant_id") == tenant_id and admin.get("role") == "admin":
+                            alert_msg = f"🤖 [تقرير الوكيل الاستباقي]:\nمرحباً، لاحظت وجود ({old_pending}) طلبات تسعير معلقة في صندوق المراجعة منذ أكثر من يومين. هل ترغب في الموافقة عليها الآن لتسريع دورة المشتريات؟"
+                            await wa_manager.send_message(admin.get("phone"), alert_msg)
         logger.info("Proactive Market Agent finished its daily check.")
     except Exception as e:
         logger.error(f"Proactive Agent Error: {e}")
@@ -801,11 +815,21 @@ async def process_queued_message(tenant_id: str, sender_phone: str, message_text
             message_text = f"[مرفق صورة تم تحليلها عبر Vision AI]: يبدو أن هذه فاتورة أو عرض سعر. الرجاء تحليلها وإعطاء الملخص.\n{message_text}"
             await wa_manager.send_message(sender_phone, "👁️ [النظام]: تم استلام الصورة وجاري قراءة محتوياتها بالرؤية الحاسوبية...")
 
-        tm_docs = list(db_firestore.collection("team_members").where("phone", "==", sender_phone).where("tenant_id", "==", tenant.id).stream())
-        team_member = tm_docs[0].to_dict() if tm_docs else None
+        tm_docs = list(db_firestore.collection("team_members").stream())
+        team_member = None
+        for doc in tm_docs:
+            d = doc.to_dict()
+            if d.get("phone") == sender_phone and d.get("tenant_id") == tenant.id:
+                team_member = d
+                break
         
-        sup_docs = list(db_firestore.collection("suppliers").where("phone", "==", sender_phone).where("tenant_id", "==", tenant.id).stream())
-        supplier_member = sup_docs[0].to_dict() if sup_docs else None
+        sup_docs = list(db_firestore.collection("suppliers").stream())
+        supplier_member = None
+        for doc in sup_docs:
+            d = doc.to_dict()
+            if d.get("phone") == sender_phone and d.get("tenant_id") == tenant.id:
+                supplier_member = d
+                break
         
         is_admin = team_member and team_member.get('role') == 'admin'
         is_sales = (team_member and team_member.get('role') == 'sales') or supplier_member is not None
@@ -855,6 +879,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.get("/health")
+@app.get("/healthz")
 async def health_check(db = Depends(get_db)):
     try:
         if db:
@@ -910,12 +935,18 @@ async def login_page(request: Request):
 async def login_post(response: Response, username: str = Form(...), password: str = Form(...), db = Depends(get_db)):
     if not db: return HTMLResponse(render_html_layout("<div class='alert alert-danger'>خطأ اتصال بقاعدة البيانات.</div>", "خطأ"))
     
-    users = list(db.collection("users").where("username", "==", username).limit(1).stream())
-    if not users:
+    users = list(db.collection("users").stream())
+    user_doc = None
+    for doc in users:
+        if doc.to_dict().get("username") == username:
+            user_doc = doc
+            break
+            
+    if not user_doc:
         content = "<div class='alert alert-danger text-center fw-bold mt-5 mx-auto' style='max-width: 500px;'><i class='bi bi-exclamation-triangle-fill me-2'></i>بيانات الدخول غير صحيحة. <a href='/login'>حاول مرة أخرى</a></div>"
         return HTMLResponse(render_html_layout(content, "خطأ"))
     
-    user_data = users[0].to_dict()
+    user_data = user_doc.to_dict()
     if not verify_password(password, user_data.get("hashed_password")):
         content = "<div class='alert alert-danger text-center fw-bold mt-5 mx-auto' style='max-width: 500px;'><i class='bi bi-exclamation-triangle-fill me-2'></i>بيانات الدخول غير صحيحة. <a href='/login'>حاول مرة أخرى</a></div>"
         return HTMLResponse(render_html_layout(content, "خطأ"))
@@ -987,8 +1018,12 @@ async def data_management_page(request: Request, db = Depends(get_db)):
     user = get_current_user_from_cookie(request, db)
     if not user or user.role != 'admin': return RedirectResponse(url="/login")
     
-    files_docs = db.collection("uploaded_files").where("tenant_id", "==", user.tenant_id).stream()
-    files = [UploadedFileModel(d.id, d.to_dict()) for d in files_docs]
+    files_docs = db.collection("uploaded_files").stream()
+    files = []
+    for d in files_docs:
+        if d.to_dict().get("tenant_id") == user.tenant_id:
+            files.append(UploadedFileModel(d.id, d.to_dict()))
+            
     files.sort(key=lambda x: x.upload_date, reverse=True)
     
     files_rows = ""
@@ -1092,8 +1127,11 @@ async def upload_suppliers_api(request: Request, file: UploadFile = File(...), d
         df = pd.read_csv(io.BytesIO(contents)) if file.filename.endswith('.csv') else pd.read_excel(io.BytesIO(contents))
         count = 0
         
-        existing_docs = db.collection("suppliers").where("tenant_id", "==", user.tenant_id).stream()
-        existing_phones = set([d.to_dict().get("phone") for d in existing_docs])
+        existing_docs = db.collection("suppliers").stream()
+        existing_phones = set()
+        for d in existing_docs:
+            if d.to_dict().get("tenant_id") == user.tenant_id:
+                existing_phones.add(d.to_dict().get("phone"))
         
         batch = db.batch()
         for index, row in df.iterrows():
@@ -1136,7 +1174,8 @@ async def add_team_member(request: Request, db = Depends(get_db)):
     
     if data.get('role') == 'worker':
         worker_username = f"worker_{data.get('phone')}"
-        existing = list(db.collection("users").where("username", "==", worker_username).limit(1).stream())
+        users_docs = list(db.collection("users").stream())
+        existing = any(d.to_dict().get("username") == worker_username for d in users_docs)
         if not existing:
             db.collection("users").add({
                 "username": worker_username,
@@ -1177,8 +1216,11 @@ async def settings_page(request: Request, db = Depends(get_db)):
     
     tree_json_str = t.decision_tree_prompt
         
-    tm_docs = db.collection("team_members").where("tenant_id", "==", t.id).stream()
-    team_members = [TeamMemberModel(d.id, d.to_dict()) for d in tm_docs]
+    tm_docs = db.collection("team_members").stream()
+    team_members = []
+    for d in tm_docs:
+        if d.to_dict().get("tenant_id") == t.id:
+            team_members.append(TeamMemberModel(d.id, d.to_dict()))
     
     team_rows = ""
     for m in team_members:
@@ -2104,11 +2146,11 @@ def process_procurement_request(message_text: str, sender_id: str, tenant: Tenan
     tenant_id = tenant.id
 
     def _search_suppliers(category: str) -> str:
-        all_suppliers = db.collection("suppliers").where("tenant_id", "==", tenant_id).stream()
+        all_suppliers = db.collection("suppliers").stream()
         suppliers = []
         for doc in all_suppliers:
             d = doc.to_dict()
-            if category.lower() in d.get("category", "").lower():
+            if d.get("tenant_id") == tenant_id and category.lower() in d.get("category", "").lower():
                 suppliers.append(d.get("name", "غير معروف"))
         
         if not suppliers:
@@ -2121,11 +2163,11 @@ def process_procurement_request(message_text: str, sender_id: str, tenant: Tenan
             item_name = parts[0]
             category = parts[1] if len(parts) > 1 else parts[0]
             
-            all_suppliers = db.collection("suppliers").where("tenant_id", "==", tenant_id).stream()
+            all_suppliers = db.collection("suppliers").stream()
             suppliers = []
             for doc in all_suppliers:
                 d = doc.to_dict()
-                if category.lower() in d.get("category", "").lower():
+                if d.get("tenant_id") == tenant_id and category.lower() in d.get("category", "").lower():
                     suppliers.append({"name": d.get("name"), "phone": d.get("phone")})
             
             if not suppliers:
@@ -2288,11 +2330,13 @@ async def register_post(request: Request, company_name: str = Form(...), admin_u
     if len(admin_password) < 8:
         return HTMLResponse(render_html_layout("<div class='alert alert-danger text-center py-4 mx-auto'>كلمة المرور يجب أن تكون 8 أحرف على الأقل.</div>", "خطأ"))
 
-    existing_tenant = list(db.collection("tenants").where("name", "==", company_name).limit(1).stream())
+    existing_tenant_docs = list(db.collection("tenants").stream())
+    existing_tenant = any(d.to_dict().get("name") == company_name for d in existing_tenant_docs)
     if existing_tenant:
         return HTMLResponse(render_html_layout("<div class='alert alert-danger text-center py-4 fs-5 mx-auto shadow-lg border-0' style='max-width:500px;'><i class='bi bi-exclamation-triangle-fill d-block fs-1 mb-2'></i> اسم الشركة مسجل مسبقاً.</div>", "خطأ"))
         
-    existing_user = list(db.collection("users").where("username", "==", admin_username).limit(1).stream())
+    existing_user_docs = list(db.collection("users").stream())
+    existing_user = any(d.to_dict().get("username") == admin_username for d in existing_user_docs)
     if existing_user:
         return HTMLResponse(render_html_layout("<div class='alert alert-danger text-center py-4 fs-5 mx-auto shadow-lg border-0' style='max-width:500px;'><i class='bi bi-exclamation-triangle-fill d-block fs-1 mb-2'></i> اسم المستخدم محجوز لمدير آخر.</div>", "خطأ"))
         
@@ -2373,7 +2417,7 @@ def install_background_service():
     return False
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 8501))
     is_silent = "--silent" in sys.argv
     
     prepare_cloud_hosting()
