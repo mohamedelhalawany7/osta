@@ -21,7 +21,6 @@ from firebase_admin import credentials, firestore
 # --- AI & LangChain ---
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END, MessagesState
-from openai import OpenAI
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from pinecone import Pinecone as PineconeClient
 from langchain_pinecone import PineconeVectorStore
@@ -30,7 +29,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # =====================================================================
 # إعدادات واجهة Streamlit وحقن تصميم النيون (CSS Injection)
 # =====================================================================
-st.set_page_config(page_title="نظام الدريني للمصانع", page_icon="⚙️", layout="wide")
+st.set_page_config(page_title="نظام الدريني للورش", page_icon="⚙️", layout="wide")
 
 st.markdown("""
 <style>
@@ -42,7 +41,6 @@ st.markdown("""
         text-align: right !important;
     }
 
-    /* الخلفية الرئيسية للتطبيق */
     .stApp {
         background-color: #0A0E17 !important;
         background-image: radial-gradient(circle at 15% 50%, rgba(176, 38, 255, 0.05), transparent 25%), 
@@ -50,22 +48,13 @@ st.markdown("""
         color: #E2E8F0 !important;
     }
 
-    h1, h2, h3, h4, h5, h6, p, label, span {
-        color: #FFF !important;
-    }
-
-    /* إخفاء القوائم الافتراضية لستريمليت */
-    #MainMenu {visibility: hidden;}
-    header {visibility: hidden;}
-    footer {visibility: hidden;}
-
-    /* شريط التنقل الجانبي */
+    h1, h2, h3, h4, h5, h6, p, label, span { color: #FFF !important; }
+    
     [data-testid="stSidebar"] {
         background-color: rgba(10, 14, 23, 0.95) !important;
         border-left: 1px solid rgba(0, 240, 255, 0.1) !important;
     }
     
-    /* الأزرار الأساسية (النيون) */
     .stButton > button {
         background-color: transparent !important;
         border: 1px solid #00F0FF !important;
@@ -81,19 +70,6 @@ st.markdown("""
         box-shadow: 0 0 20px #00F0FF !important;
     }
 
-    /* أزرار الحذف/الخطر */
-    button[kind="secondary"] {
-        border-color: #FF003C !important;
-        color: #FF003C !important;
-        box-shadow: inset 0 0 10px rgba(255, 0, 60, 0.1) !important;
-    }
-    button[kind="secondary"]:hover {
-        background-color: #FF003C !important;
-        color: #FFF !important;
-        box-shadow: 0 0 20px #FF003C !important;
-    }
-
-    /* حقول الإدخال */
     .stTextInput > div > div > input, .stSelectbox > div > div > select, .stTextArea > div > div > textarea {
         background-color: rgba(0,0,0,0.5) !important;
         color: #00F0FF !important;
@@ -105,7 +81,6 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(0, 240, 255, 0.3) !important;
     }
 
-    /* المحادثة والشات */
     [data-testid="stChatMessage"] {
         background-color: rgba(16, 22, 35, 0.9) !important;
         border: 1px solid rgba(0, 240, 255, 0.2) !important;
@@ -113,17 +88,12 @@ st.markdown("""
         padding: 15px !important;
         margin-bottom: 10px !important;
     }
-    [data-testid="stChatMessage"] .stMarkdown p {
-        color: #FFF !important;
-        font-size: 16px !important;
-    }
-    
+    [data-testid="stChatMessage"] .stMarkdown p { color: #FFF !important; font-size: 16px !important; }
     [data-testid="stChatInput"] {
         background-color: rgba(10, 14, 23, 0.95) !important;
         border-top: 1px solid rgba(0, 240, 255, 0.2) !important;
     }
     
-    /* صناديق البيانات (Cards) */
     div[data-testid="stExpander"] {
         background: rgba(16, 22, 35, 0.8) !important;
         border: 1px solid rgba(0, 240, 255, 0.2) !important;
@@ -135,7 +105,6 @@ st.markdown("""
 # =====================================================================
 # التشفير والاتصال بقاعدة بيانات Firebase (جاهز للسحابة)
 # =====================================================================
-# مفتاح تشفير ثابت لضمان عدم ضياع كلمات المرور عند إعادة تشغيل السيرفر السحابي
 fallback_key = base64.urlsafe_b64encode(hashlib.sha256(b"Elderiny_Secret_Key_2026").digest())
 FERNET_KEY = os.getenv("FERNET_KEY", fallback_key.decode())
 cipher = Fernet(FERNET_KEY.encode())
@@ -161,7 +130,6 @@ def init_firebase():
         try:
             if "firebase" in st.secrets:
                 fb_secrets = dict(st.secrets["firebase"])
-                # إصلاح مشكلة السطور المتكسرة في المفتاح السري عبر Streamlit Cloud
                 if "private_key" in fb_secrets:
                     fb_secrets["private_key"] = fb_secrets["private_key"].replace('\\n', '\n')
                 
@@ -244,7 +212,6 @@ def fetch_rag(tenant_data, query):
 
 def init_system():
     if db is None: return
-    # التأكد من وجود شركة ومدير افتراضي في قاعدة البيانات
     tenants = list(db.collection("tenants").limit(1).stream())
     if not tenants:
         t_ref = db.collection("tenants").document()
@@ -266,15 +233,15 @@ def login_view():
     
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
-        with st.container():
+        with st.form("login_form"):
             username = st.text_input("اسم المستخدم أو رقم الموبايل (للعمال)")
             password = st.text_input("الرقم السري", type="password")
             
-            if st.button("دخول مؤمن 🚀", use_container_width=True):
+            if st.form_submit_button("دخول مؤمن 🚀", use_container_width=True):
                 if db is None:
                     st.error("قاعدة البيانات غير متصلة. تأكد من الإعدادات.")
                     return
-                users = list(db.collection("users").where("username", "==", username).stream())
+                users = list(db.collection("users").where("username", "==", username).limit(1).stream())
                 if users:
                     u_data = users[0].to_dict()
                     if verify_password(password, u_data["hashed_password"]):
@@ -284,14 +251,49 @@ def login_view():
                         st.rerun()
                 st.error("بيانات الدخول غير صحيحة.")
 
+def register_view():
+    st.markdown("<h1 style='text-align: center; color: #39FF14;'>تسجيل ورشة/شركة جديدة</h1>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        with st.form("register_form"):
+            company_name = st.text_input("اسم الورشة / الشركة")
+            admin_username = st.text_input("اسم المستخدم (للدخول)")
+            admin_password = st.text_input("كلمة المرور", type="password")
+            
+            if st.form_submit_button("تسجيل وإنشاء مساحة العمل 🚀", use_container_width=True):
+                if len(company_name) < 3 or len(admin_username) < 3 or len(admin_password) < 6:
+                    st.error("يرجى إدخال بيانات صحيحة (الاسم 3 أحرف على الأقل، والباسورد 6).")
+                else:
+                    existing_t = list(db.collection("tenants").where("name", "==", company_name).limit(1).stream())
+                    existing_u = list(db.collection("users").where("username", "==", admin_username).limit(1).stream())
+                    
+                    if existing_t:
+                        st.error("اسم الشركة مسجل مسبقاً.")
+                    elif existing_u:
+                        st.error("اسم المستخدم محجوز لمدير آخر.")
+                    else:
+                        t_ref = db.collection("tenants").document()
+                        t_ref.set({
+                            "name": company_name,
+                            "llm_model": "gpt-4o",
+                            "cs_prompt": "أنت 'الأسطى الآلي'، كبير المهندسين في شركة تصنيع معدات هندسية. تتحدث بلهجة مصرية عامية (صنايعي صميم). العمال بسطاء، لذا أعطهم حلول هندسية مظبوطة جداً وبلغة بلدية سهلة. امش معاهم خطوة بخطوة."
+                        })
+                        db.collection("users").add({
+                            "username": admin_username,
+                            "hashed_password": get_password_hash(admin_password),
+                            "role": "admin",
+                            "tenant_id": t_ref.id
+                        })
+                        st.success("تم الإنشاء بنجاح! يمكنك الآن العودة وتسجيل الدخول.")
+
 def chat_view():
     st.subheader("الأسطى الآلي 👷‍♂️")
-    st.info("🎤 **للعمال:** لتسجيل مشكلتك بالصوت، اضغط على علامة (المايكروفون) الموجودة في لوحة مفاتيح الموبايل الخاصة بك.")
+    st.info("🎤 **للعمال:** لتسجيل مشكلتك بالصوت، اضغط على علامة (المايكروفون) في لوحة مفاتيح الموبايل، وسينطق الأسطى الرد فوراً.")
     
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "assistant", "content": "يا هلا بيك يا بطل في الورشة، معاك الأسطى الآلي. المكنة فيها إيه؟ سجل صوتك أو اكتبلي."}]
         
-    # عرض المحادثة
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"], avatar="🧑‍🔧" if msg["role"] == "user" else "👷"):
             st.markdown(msg["content"])
@@ -320,10 +322,9 @@ def chat_view():
                 else:
                     st.error("مفاتيح الذكاء الاصطناعي غير متوفرة. الرجاء إبلاغ المدير لإضافتها في الإعدادات.")
 
-    # تشغيل النطق الصوتي للرد الأخير (Speech Synthesis)
     if st.session_state.get("last_audio"):
         clean_text = st.session_state.last_audio.replace('\n', ' ').replace("'", "").replace('"', '')
-        clean_text = re.sub(r'[*_#]', '', clean_text) # تنظيف الماركداون
+        clean_text = re.sub(r'[*_#]', '', clean_text) 
         
         js_code = f"""
         <script>
@@ -332,7 +333,7 @@ def chat_view():
                 const text = "{clean_text}";
                 const utterance = new SpeechSynthesisUtterance(text);
                 utterance.lang = 'ar-EG'; 
-                utterance.pitch = 0.8; // صوت خشن قليلاً يناسب الأسطى
+                utterance.pitch = 0.8; 
                 utterance.rate = 1.0;
                 window.speechSynthesis.speak(utterance);
             }}
@@ -356,14 +357,12 @@ def data_management_view():
     if uploaded_file and st.button("رفع وتدريب الأسطى", type="primary"):
         with st.spinner("جاري قراءة الملف وتخزينه في Pinecone..."):
             try:
-                # 1. حفظ في الفايربيز كمرجع
                 db.collection("uploaded_files").add({
                     "filename": uploaded_file.name,
                     "upload_date": datetime.utcnow(),
                     "tenant_id": tenant_id
                 })
                 
-                # 2. معالجة النص
                 text = ""
                 if uploaded_file.name.endswith(".pdf"):
                     pdf_reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
@@ -372,7 +371,6 @@ def data_management_view():
                 else:
                     text = uploaded_file.getvalue().decode('utf-8')
                     
-                # 3. التدريب
                 embeddings = OpenAIEmbeddings(openai_api_key=decrypt_val(t_data["openai_api_key"]))
                 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
                 chunks = text_splitter.split_text(text)
@@ -416,7 +414,6 @@ def settings_view():
             w_phone = st.text_input("رقم الموبايل")
             if st.form_submit_button("إضافة عامل"):
                 if w_name and w_phone:
-                    # إضافة لجدول المستخدمين
                     db.collection("users").add({
                         "username": w_phone,
                         "hashed_password": get_password_hash(w_phone),
@@ -444,7 +441,6 @@ def settings_view():
                 "pinecone_index": new_index
             })
             st.success("تم الحفظ بنجاح!")
-            # تحديث الـ Session
             t_ref = db.collection("tenants").document(t_data["id"]).get()
             st.session_state.tenant = {"id": t_ref.id, **t_ref.to_dict()}
 
@@ -465,15 +461,31 @@ def main_router():
     
     if "user" not in st.session_state:
         st.session_state.user = None
+    if "view" not in st.session_state:
+        st.session_state.view = "login"
 
     if st.session_state.user is None:
-        login_view()
+        if st.session_state.view == "login":
+            login_view()
+            st.markdown("<br><hr>", unsafe_allow_html=True)
+            col1, col2, col3 = st.columns([1,2,1])
+            with col2:
+                if st.button("لا تملك حساب للورشة؟ تسجيل شركة جديدة", use_container_width=True):
+                    st.session_state.view = "register"
+                    st.rerun()
+        else:
+            register_view()
+            st.markdown("<br><hr>", unsafe_allow_html=True)
+            col1, col2, col3 = st.columns([1,2,1])
+            with col2:
+                if st.button("العودة لتسجيل الدخول", use_container_width=True):
+                    st.session_state.view = "login"
+                    st.rerun()
     else:
         st.sidebar.markdown(f"<h3 style='color:#00F0FF;'>نظام الدريني</h3>", unsafe_allow_html=True)
         st.sidebar.write(f"مرحباً: **{st.session_state.user['username']}**")
         st.sidebar.divider()
         
-        # توجيه الصفحات حسب الصلاحية
         if st.session_state.user["role"] == "admin":
             pages = ["الأسطى الآلي (شات)", "إدارة البيانات والملفات", "الإعدادات"]
         else:
@@ -486,7 +498,6 @@ def main_router():
             st.session_state.user = None
             st.rerun()
             
-        # عرض الصفحة المحددة
         if selected == "الأسطى الآلي (شات)":
             chat_view()
         elif selected == "إدارة البيانات والملفات":
