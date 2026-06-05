@@ -3,13 +3,15 @@ uvicorn
 firebase-admin
 bcrypt
 python-jose[cryptography]
+cryptography
 openai
 langchain-openai
 langchain-community
 langchain-anthropic
 langchain-google-genai
 langchain-pinecone
-pinecone-client
+langchain-text-splitters
+pinecone
 pypdf
 pandas
 openpyxl
@@ -18,4 +20,4 @@ slowapi
 apscheduler
 langgraph
 pyngrok
-python-multipart
+python-dotenv
