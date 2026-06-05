@@ -429,6 +429,17 @@ def get_current_user_from_cookie(request: Request, db = Depends(get_db)):
         
         user_data = user_doc.to_dict()
         user_model = UserModel(user_doc.id, user_data)
+        
+        tenant_id = user_data.get("tenant_id")
+        if tenant_id:
+            tenant_doc = db.collection("tenants").document(tenant_id).get()
+            if tenant_doc.exists:
+                user_model.tenant = TenantModel(tenant_doc.id, tenant_doc.to_dict())
+                
+        return user_model
+    except JWTError:
+        return None
+
 def render_html_layout(content: str, title: str, user=None):
     nav_links = ""
     if user:
