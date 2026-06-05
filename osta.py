@@ -36,6 +36,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Remo
 
 import bcrypt
 from jose import JWTError, jwt
+import streamlit as st  # إضافة استيراد Streamlit لدعم الأسرار السحابية
 
 # --- استيرادات Firebase الجديدة ---
 import firebase_admin
@@ -124,19 +125,31 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # =====================================================================
-# تهيئة قاعدة بيانات Firebase (بديلة لـ SQL)
+# تهيئة قاعدة بيانات Firebase (بديلة لـ SQL) مع دعم Streamlit Secrets
 # =====================================================================
 if not firebase_admin._apps:
     try:
-        if os.path.exists("firebase-key.json"):
-            cred = credentials.Certificate("firebase-key.json")
-            firebase_admin.initialize_app(cred)
-            logger.info("تم الربط مع Firebase باستخدام ملف المفاتيح بنجاح.")
-        else:
-            logger.warning("ملف firebase-key.json غير موجود. سيتم محاولة استخدام الصلاحيات الافتراضية للبيئة.")
-            firebase_admin.initialize_app()
+        # 1. محاولة قراءة المفاتيح من Streamlit Secrets (لمنصة Streamlit Cloud)
+        try:
+            if "firebase" in st.secrets:
+                firebase_secrets = dict(st.secrets["firebase"])
+                cred = credentials.Certificate(firebase_secrets)
+                firebase_admin.initialize_app(cred)
+                logger.info("تم الربط مع Firebase باستخدام Streamlit Secrets بنجاح.")
+        except Exception as st_e:
+            logger.warning("لم يتم العثور على Streamlit Secrets أو فشل قراءتها.")
+
+        # 2. محاولة القراءة من الملف المحلي (لمنصة Render أو العمل المحلي)
+        if not firebase_admin._apps:
+            if os.path.exists("firebase-key.json"):
+                cred = credentials.Certificate("firebase-key.json")
+                firebase_admin.initialize_app(cred)
+                logger.info("تم الربط مع Firebase باستخدام ملف المفاتيح المحلي بنجاح.")
+            else:
+                logger.warning("ملف firebase-key.json غير موجود. سيتم محاولة استخدام الصلاحيات الافتراضية.")
+                firebase_admin.initialize_app()
     except Exception as e:
-        logger.error(f"خطأ في تهيئة Firebase: {e}")
+        logger.error(f"خطأ جذري في تهيئة Firebase: {e}")
 
 try:
     db_firestore = firestore.client()
@@ -2417,6 +2430,15 @@ def install_background_service():
     return False
 
 if __name__ == "__main__":
+    # تنبيه هام في حالة محاولة تشغيل الملف عبر منصة Streamlit Cloud
+    try:
+        if st.runtime.exists():
+            st.error("⚠️ خطأ في بيئة التشغيل: هذا التطبيق مبني بمعمارية FastAPI لدعم التصميم المخصص ولا يمكن تشغيله كواجهة Streamlit Cloud.")
+            st.info("💡 لرفع التطبيق مجاناً بشكل صحيح: استخدم منصة Render.com أو Railway (كما هو موضح في ملف 'كيف_ارفع_التطبيق_مجانا.txt').")
+            sys.exit(1)
+    except Exception:
+        pass
+
     port = int(os.getenv("PORT", 8501))
     is_silent = "--silent" in sys.argv
     
