@@ -160,15 +160,33 @@ def init_firebase():
     if not firebase_admin._apps:
         try:
             if "firebase" in st.secrets:
-                cred = credentials.Certificate(dict(st.secrets["firebase"]))
-                firebase_admin.initialize_app(cred)
+                fb_secrets = dict(st.secrets["firebase"])
+                # إصلاح مشكلة السطور المتكسرة في المفتاح السري عبر Streamlit Cloud
+                if "private_key" in fb_secrets:
+                    fb_secrets["private_key"] = fb_secrets["private_key"].replace('\\n', '\n')
+                
+                project_id = fb_secrets.get("project_id")
+                if project_id:
+                    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+                
+                cred = credentials.Certificate(fb_secrets)
+                firebase_admin.initialize_app(cred, {'projectId': project_id})
+                
             elif os.path.exists("firebase-key.json"):
-                cred = credentials.Certificate("firebase-key.json")
-                firebase_admin.initialize_app(cred)
+                with open("firebase-key.json", "r", encoding="utf-8") as f:
+                    fb_keys = json.load(f)
+                
+                project_id = fb_keys.get("project_id")
+                if project_id:
+                    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+                    
+                cred = credentials.Certificate(fb_keys)
+                firebase_admin.initialize_app(cred, {'projectId': project_id})
             else:
                 firebase_admin.initialize_app()
         except Exception as e:
             st.error(f"خطأ في الاتصال بـ Firebase: {e}")
+            return None
     return firestore.client()
 
 db = init_firebase()
@@ -225,6 +243,7 @@ def fetch_rag(tenant_data, query):
 # =====================================================================
 
 def init_system():
+    if db is None: return
     # التأكد من وجود شركة ومدير افتراضي في قاعدة البيانات
     tenants = list(db.collection("tenants").limit(1).stream())
     if not tenants:
@@ -252,6 +271,9 @@ def login_view():
             password = st.text_input("الرقم السري", type="password")
             
             if st.button("دخول مؤمن 🚀", use_container_width=True):
+                if db is None:
+                    st.error("قاعدة البيانات غير متصلة. تأكد من الإعدادات.")
+                    return
                 users = list(db.collection("users").where("username", "==", username).stream())
                 if users:
                     u_data = users[0].to_dict()
