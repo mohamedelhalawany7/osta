@@ -1,6 +1,8 @@
-streamlit
+fastapi
+uvicorn
 firebase-admin
 bcrypt
+python-jose[cryptography]
 cryptography
 openai
 langchain-openai
@@ -14,5 +16,8 @@ pypdf
 pandas
 openpyxl
 httpx
+slowapi
 apscheduler
 langgraph
+pyngrok
+python-dotenv
