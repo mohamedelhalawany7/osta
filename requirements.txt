@@ -1,12 +1,11 @@
 streamlit>=1.36.0
 firebase-admin
 pinecone-client
-langchain>=0.1.0
-langchain-community
-langchain-openai
-langchain-pinecone
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0
+langchain-pinecone>=0.1.0
 openai
 edge-tts
 PyMuPDF
 python-dotenv
-asyncio
