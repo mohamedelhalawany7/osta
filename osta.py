@@ -1,1686 +1,414 @@
-import os
-import sys
-import io
-import json
-import base64
-import time
-import uuid
-from datetime import datetime, timedelta
-from typing import Optional, AsyncGenerator, List
-import logging
-from cryptography.fernet import Fernet
-import hashlib
-from pydantic import BaseModel, ConfigDict, Field
-from threading import Lock
-import tempfile
-import openai
-
-import html
-import asyncio
-import secrets
-from cachetools import TTLCache
-
-try:
-    import magic
-    MAGIC_AVAILABLE = True
-except ImportError:
-    import mimetypes
-    MAGIC_AVAILABLE = False
-    print("تنبيه: مكتبة python-magic أو ملفات DLL الخاصة بها غير متوافقة أو مفقودة. سيتم استخدام mimetypes كبديل.")
-
-import uvicorn
-from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, HTTPException, status, BackgroundTasks, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
-
-# --- Environment & Rate Limiting ---
-from dotenv import load_dotenv
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-
-# --- Resiliency & Cron ---
-from tenacity import retry, stop_after_attempt, wait_exponential
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# --- LangGraph & Memory ---
-from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
-# --- Database (Async) ---
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, select, text, func
-from sqlalchemy.orm import declarative_base, relationship
-import bcrypt
-from jose import JWTError, jwt
-
-# --- Langchain ---
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
-from pinecone import Pinecone as PineconeClient
-from langchain_pinecone import PineconeVectorStore
-from langchain_anthropic import ChatAnthropic
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from contextlib import asynccontextmanager
-
-# --- Middleware ---
-from starlette.middleware.base import BaseHTTPMiddleware
-
-# --- Cloud & NoSQL Databases ---
+import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, firestore
-
-# =====================================================================
-# الإعدادات الأولية والأمان
-# =====================================================================
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-logger = logging.getLogger(__name__)
-
-class Vault:
-    @staticmethod
-    def get_secret(key_name: str, default_value: str = "") -> str:
-        return os.getenv(key_name, default_value)
-
-FERNET_KEY = Vault.get_secret("FERNET_KEY")
-if not FERNET_KEY:
-    FERNET_KEY = Fernet.generate_key().decode()
-    with open(".env", "a", encoding="utf-8") as f: f.write(f"\nFERNET_KEY={FERNET_KEY}\n")
-cipher = Fernet(FERNET_KEY.encode())
-
-def encrypt_val(value: str) -> str: return cipher.encrypt(value.encode()).decode() if value else ""
-def decrypt_val(value: str) -> str:
-    if not value: return ""
-    try: return cipher.decrypt(value.encode()).decode()
-    except: return value
-
-# 1. إجبار SECRET_KEY على أن يكون ثابتاً عبر .env
-SECRET_KEY = Vault.get_secret("SECRET_KEY")
-if not SECRET_KEY:
-    SECRET_KEY = secrets.token_urlsafe(32)
-    with open(".env", "a", encoding="utf-8") as f: f.write(f"\nSECRET_KEY={SECRET_KEY}\n")
-
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 14400 
-IS_PRODUCTION = Vault.get_secret("ENV", "development") == "production"
-
-def verify_password(plain_password, hashed_password): return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-def get_password_hash(password): return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# =====================================================================
-# قاعدة البيانات والكاش
-# =====================================================================
-if IS_PRODUCTION:
-    raw_db_url = Vault.get_secret("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/workshop_db")
-    # دعم وتوافق شامل لجميع قواعد البيانات السحابية (PostgreSQL, MySQL, SQLite)
-    if raw_db_url.startswith("postgres://"):
-        raw_db_url = raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif raw_db_url.startswith("postgresql://") and not raw_db_url.startswith("postgresql+asyncpg://"):
-        raw_db_url = raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif raw_db_url.startswith("mysql://"):
-        raw_db_url = raw_db_url.replace("mysql://", "mysql+aiomysql://", 1)
-    SQLALCHEMY_DATABASE_URL = raw_db_url
-else:
-    SQLALCHEMY_DATABASE_URL = Vault.get_secret("DATABASE_URL", "sqlite+aiosqlite:///./workshop_db.sqlite")
-
-# إعدادات متقدمة لحماية الذاكرة (Memory Protection) ومنع انهيار قواعد البيانات المجانية
-engine_kwargs = {"echo": False}
-if not SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
-    engine_kwargs.update({
-        "pool_size": int(Vault.get_secret("DB_POOL_SIZE", 5)),       # حد أقصى للاتصالات المتزامنة لعدم إرهاق السيرفر المجاني
-        "max_overflow": int(Vault.get_secret("DB_MAX_OVERFLOW", 10)),# أقصى اتصالات إضافية وقت الضغط
-        "pool_recycle": 1800,                                        # تجديد الاتصال كل 30 دقيقة لتفادي انقطاع (Timeout) السيرفرات السحابية
-        "pool_pre_ping": True                                        # فحص سلامة الاتصال قبل إرسال الاستعلام لمنع انهيار التطبيق
-    })
-
-engine = create_async_engine(SQLALCHEMY_DATABASE_URL, **engine_kwargs)
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-Base = declarative_base()
-
-# --- تهيئة Firebase السحابية كخيار موازي وجاهز للاستخدام ---
-firebase_cred_json = Vault.get_secret("FIREBASE_CREDENTIALS")
-firebase_db = None
-if firebase_cred_json:
-    try:
-        cred_dict = json.loads(firebase_cred_json)
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred)
-        firebase_db = firestore.client()
-        logger.info("تم تهيئة Firebase Firestore بنجاح وهو جاهز للاستخدام.")
-    except Exception as e:
-        logger.error(f"خطأ في تهيئة Firebase: {e}")
-
-class ChatSession(Base):
-    __tablename__ = "chat_sessions"
-    id = Column(Integer, primary_key=True, index=True)
-    session_uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()))
-    title = Column(String, default="محادثة جديدة")
-    user_id = Column(Integer, ForeignKey("users.id"))
-    tenant_id = Column(Integer, ForeignKey("tenants.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class ConversationHistory(Base):
-    __tablename__ = "conversation_history"
-    id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(String, index=True)
-    role = Column(String)
-    content = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"))
-
-class UploadedDocument(Base):
-    __tablename__ = "uploaded_documents"
-    id = Column(Integer, primary_key=True, index=True)
-    filename = Column(String)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"))
-    tenant = relationship("Tenant", back_populates="documents")
-
-class Alert(Base):
-    __tablename__ = "alerts"
-    id = Column(Integer, primary_key=True, index=True)
-    message = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"))
-
-class Tenant(Base):
-    __tablename__ = "tenants"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
-    llm_provider = Column(String, default="google")
-    llm_model = Column(String, default="gemini-1.5-flash")
-    api_base_url = Column(String, default="")
-    openai_api_key = Column(String, default="")
-    anthropic_api_key = Column(String, default="")
-    google_api_key = Column(String, default="")
-    pinecone_api_key = Column(String, default="")
-    pinecone_index = Column(String, default="")
-    workshop_prompt = Column(Text, default="""أنت 'الأسطى بلية'، أقدم وأشطر صنايعي ومهندس في ورشة ميكانيكا وصيانة ضواغط هواء ومجففات في مصر.
-العمال اللي بيكلموك صنايعية على قدهم ومابيعرفوش يقرأوا ويكتبوا، عشان كده:
-1. اتكلم معاهم بلهجة مصرية بلدي صميمة، زي الصنايعية الكبار في الورش (يا بطل، يا هندسة، يا ريس، بص يا سيدي، صلي على النبي، هاتها في شوال).
-2. اشرح المشكلة وحلها ببساطة جداً وبدون أي مصطلحات إنجليزي مكلكعة، ولو اضطريت تستخدم اسم قطعة انجليزي بسطه وقول بيعمل إيه.
-3. خليك جدع ومشجع وبتحل المشاكل من الأخر بخطوات عملية 1، 2، 3.
-4. لو بعتولك صورة، ركز فيها كويس وقولهم فيها إيه بالظبط وايه اللي بايظ وكيفية صيانته حتة حتة.
-5. اعتمد في إجاباتك على معلومات الكتالوجات المرفقة، وضيف عليها خبرتك كـ "أسطى كبير" في السوق لتكون الإجابة كاملة.""")
-    users = relationship("User", back_populates="tenant")
-    documents = relationship("UploadedDocument", back_populates="tenant", cascade="all, delete-orphan")
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    role = Column(String, default="admin") 
-    tenant_id = Column(Integer, ForeignKey("tenants.id"))
-    tenant = relationship("Tenant", back_populates="users")
-
-# نظام الكاش الآمن في الـ Multi-worker البيئة
-tenant_cache = TTLCache(maxsize=200, ttl=300)
-tenant_cache_lock = Lock()
-
-async def get_tenant_cached(tenant_id: int, db: AsyncSession):
-    with tenant_cache_lock:
-        if tenant_id in tenant_cache:
-            return tenant_cache[tenant_id]
-    tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalars().first()
-    if tenant:
-        with tenant_cache_lock:
-            tenant_cache[tenant_id] = tenant
-    return tenant
-
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        try: yield session
-        finally: await session.close()
-
-async def get_chat_history(session_id: str, db: AsyncSession, limit: int = 5) -> str:
-    result = await db.execute(
-        select(ConversationHistory)
-        .where(ConversationHistory.session_id == session_id)
-        .order_by(ConversationHistory.created_at.desc())
-        .limit(limit)
-    )
-    history = result.scalars().all()
-    if not history: return ""
-    return "\n".join([f"{h.role}: {h.content}" for h in reversed(history)])
-
-async def save_chat_history(session_id: str, role: str, content: str, db: AsyncSession, tenant_id: int):
-    clean_content = content[:1000] if "data:image" not in content else "[صورة مرفقة]"
-    db.add(ConversationHistory(session_id=session_id, role=role, content=clean_content, tenant_id=tenant_id))
-    await db.commit()
-
-# =====================================================================
-# Singleton Instances & Cron Jobs
-# =====================================================================
-pc_client_instance = None
-scheduler = AsyncIOScheduler()
-
-async def analyze_machine_issues_cron():
-    logger.info("Starting Daily Cron Job: Analyzing machine issues...")
-    async with AsyncSessionLocal() as db:
-        tenants = (await db.execute(select(Tenant))).scalars().all()
-        for tenant in tenants:
-            if not tenant.openai_api_key: continue
-            openai_key = decrypt_val(tenant.openai_api_key)
-            
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-            history_result = await db.execute(
-                select(ConversationHistory)
-                .where(ConversationHistory.tenant_id == tenant.id)
-                .where(ConversationHistory.created_at >= thirty_days_ago)
-                .order_by(ConversationHistory.created_at.desc())
-                .limit(500) # تحسين الأداء: تقييد العدد لتجنب انهيار الميموري
-            )
-            history = history_result.scalars().all()
-            if len(history) < 10: continue
-            
-            text_log = "\n".join([f"{h.role}: {h.content}" for h in history])
-            prompt = """بصفتك مهندس صيانة ذكي، قم بتحليل سجلات محادثات العمال التالية خلال الشهر الماضي. 
-هل تلاحظ وجود عطل في ماكينة معينة أو ضاغط هواء معين تكرر السؤال عنه أكثر من مرتين؟
-إذا وجدت تكراراً يعطي مؤشراً على مشكلة مزمنة، اكتب تنبيهاً واحداً مباشراً وموجزاً يوضح الماكينة والمشكلة لمدير الورشة.
-إذا كانت الأمور طبيعية ولا يوجد تكرار ملحوظ لأعطال خطيرة، اكتب فقط 'لا يوجد' ولا تضف أي كلمة أخرى."""
-            
-            try:
-                llm = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_key, temperature=0.0)
-                res = await llm.ainvoke([SystemMessage(content=prompt), HumanMessage(content=text_log)])
-                if "لا يوجد" not in res.content:
-                    db.add(Alert(tenant_id=tenant.id, message=f"⚠️ تنبيه ذكي: {res.content}"))
-                    await db.commit()
-            except Exception as e:
-                logger.error(f"Cron LLM error: {e}")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pc_client_instance
-    async with engine.begin() as conn:
-        # تم إزالة شرط "لو مش في الإنتاج" عشان التطبيق يبني جداوله تلقائياً على السحابة
-        await conn.run_sync(Base.metadata.create_all)
-        try:
-            await conn.execute(text("ALTER TABLE tenants ADD COLUMN api_base_url VARCHAR DEFAULT ''"))
-        except Exception:
-            pass
-
-    async with AsyncSessionLocal() as db:
-        tenant = (await db.execute(select(Tenant))).scalars().first()
-        if not tenant:
-            default_tenant = Tenant(name="ورشة الصيانة والتصنيع")
-            db.add(default_tenant)
-            await db.commit()
-            await db.refresh(default_tenant)
-            db.add(User(username="admin", hashed_password=get_password_hash("admin123"), role="admin", tenant_id=default_tenant.id))
-            db.add(User(username="worker", hashed_password=get_password_hash("1234"), role="worker", tenant_id=default_tenant.id))
-            await db.commit()
-            tenant = default_tenant
-
-        if tenant and tenant.pinecone_api_key:
-            pk = decrypt_val(tenant.pinecone_api_key)
-            if pk:
-                pc_client_instance = PineconeClient(api_key=pk)
-                logger.info("Pinecone Client Initialized (Singleton).")
-
-    scheduler.add_job(analyze_machine_issues_cron, 'cron', hour=2, minute=0)
-    scheduler.start()
-    yield
-    scheduler.shutdown()
-    await engine.dispose()
-
-app = FastAPI(title="Workshop Kiosk AI", lifespan=lifespan)
-
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        # حماية إضافية من نوع Content-Security-Policy
-        response.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https://cdn.jsdelivr.net fonts.googleapis.com fonts.gstatic.com;"
-        return response
-app.add_middleware(SecurityHeadersMiddleware)
-
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# =====================================================================
-# معالجة أخطاء الـ 404 بشكل ذكي & الملفات المهمة للـ SEO
-# =====================================================================
-@app.get("/robots.txt")
-async def robots():
-    return Response("User-agent: *\nDisallow: /api/\nDisallow: /dashboard/", media_type="text/plain")
-
-def render_html_layout(content: str, title: str, user=None):
-    nav_links = ""
-    if user:
-        if user.role == 'admin':
-            nav_links = """
-            <li class="nav-item"><a class="nav-link" href="/dashboard"><i class="bi bi-speedometer2"></i> لوحة التحكم</a></li>
-            <li class="nav-item"><a class="nav-link" href="/users"><i class="bi bi-people"></i> إدارة العمال</a></li>
-            <li class="nav-item"><a class="nav-link" href="/chat"><i class="bi bi-mic-fill"></i> شاشة العمال (Kiosk)</a></li>
-            <li class="nav-item"><a class="nav-link" href="/data_management"><i class="bi bi-journal-arrow-up"></i> الكتالوجات والبيانات</a></li>
-            <li class="nav-item"><a class="nav-link" href="/settings"><i class="bi bi-gear"></i> إعدادات النظام</a></li>
-            """
-        else:
-            nav_links = """<li class="nav-item"><a class="nav-link active" href="/chat"><i class="bi bi-mic-fill"></i> المساعد الصوتي</a></li>"""
-            
-        nav_links += f'<li class="nav-item mt-5"><a class="btn-logout text-center fw-bold" href="/logout"><i class="bi bi-box-arrow-right me-2"></i> خروج</a></li>'
-
-    return f"""
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
-        <title>{title} | مساعد الورشة الذكي</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
-        <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap" rel="stylesheet">
-        <style>
-            :root {{
-                --bg-main: #121212; --bg-card: #1e1e1e; --text-main: #e0e0e0;
-                --primary: #FF9800;
-                --sidebar-width: 260px;
-            }}
-            body {{ font-family: 'Cairo', sans-serif; background-color: var(--bg-main); color: var(--text-main); margin: 0; display: flex; flex-direction: column; min-height: 100vh; overflow-x: hidden; }}
-            .sidebar {{ width: var(--sidebar-width); background-color: #000; position: fixed; right: 0; top: 0; height: 100vh; padding-top: 2rem; border-left: 2px solid #333; z-index: 1000; transition: 0.3s; }}
-            .sidebar .nav-link {{ color: #aaa !important; font-weight: 700; font-size: 1.1rem; padding: 0.8rem; margin: 0.3rem 1rem; border-radius: 10px; transition: 0.3s; }}
-            .sidebar .nav-link.active, .sidebar .nav-link:hover {{ background-color: rgba(255, 152, 0, 0.1) !important; color: var(--primary) !important; border: 1px solid var(--primary); }}
-            .btn-logout {{ background-color: #2a0000; color: #ff4d4d; border-radius: 10px; padding: 1rem; margin: 1rem; display: block; text-decoration: none; border: 1px solid #ff4d4d; }}
-            .main-content {{ margin-right: var(--sidebar-width); flex: 1; padding: 2rem; width: calc(100% - var(--sidebar-width)); display: flex; flex-direction: column; }}
-            
-            /* تأثير التظليل للبطاقات (Cards) عند المرور عليها */
-            .card {{ background-color: var(--bg-card); border: 1px solid #333; border-radius: 15px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); transition: all 0.3s ease; }}
-            .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 25px rgba(255, 152, 0, 0.4); border-color: var(--primary); z-index: 10; }}
-            
-            .card-header {{ border-bottom: 1px solid #333; font-weight: bold; font-size: 1.2rem; background: #1a1a1a; padding: 15px; }}
-            
-            /* تأثير التظليل لحقول الإدخال عند التركيز عليها */
-            .form-control, .form-select {{ background: #222 !important; border: 1px solid #444 !important; color: #fff !important; font-size: 1.1rem; padding: 10px; transition: all 0.3s ease; }}
-            .form-control:focus, .form-select:focus {{ box-shadow: 0 0 10px rgba(255, 152, 0, 0.5); border-color: var(--primary) !important; }}
-            
-            .btn-primary {{ background-color: var(--primary); border: none; color: #000; font-weight: bold; }}
-            .btn-primary:hover {{ background-color: #e68a00; color: #000; }}
-            
-            @media (max-width: 992px) {{
-                .sidebar {{ transform: translateX(100%); }}
-                .sidebar.show {{ transform: translateX(0); }}
-                .main-content {{ margin-right: 0; width: 100%; padding: 1rem; }}
-                .mobile-header {{ display: flex; justify-content: space-between; padding: 15px; background: #000; border-bottom: 1px solid #333; z-index: 1001; }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="mobile-header d-lg-none">
-            <h4 class="mb-0 fw-bold" style="color: var(--primary);"><i class="bi bi-tools me-2"></i> المساعد</h4>
-            <button class="btn btn-outline-light" onclick="document.querySelector('.sidebar').classList.toggle('show')"><i class="bi bi-list fs-3"></i></button>
-        </div>
-        
-        {f'<aside class="sidebar"><div class="text-center mb-4"><i class="bi bi-tools display-4 text-warning"></i><h4 class="mt-2 text-white">نظام الورشة</h4></div><ul class="nav flex-column">{nav_links}</ul></aside>' if user else ''}
-        
-        <main class="main-content" style="{'' if user else 'margin-right:0; width:100%; justify-content:center;'}">
-            {content}
-        </main>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    </body>
-    </html>
-    """
-
-@app.exception_handler(StarletteHTTPException)
-async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    if exc.status_code == 404:
-        if request.url.path.startswith("/api/"):
-            return JSONResponse({"error": "المسار غير موجود"}, status_code=404)
-        
-        content = """
-        <div class="card shadow-lg mx-auto" style="max-width: 500px; margin-top: 10vh;">
-            <div class="card-body p-5 text-center">
-                <i class="bi bi-exclamation-triangle display-1 text-danger"></i>
-                <h2 class="fw-bold my-4 text-white">404 - الصفحة غير موجودة</h2>
-                <p class="text-muted mb-4">يا هندسة، الصفحة اللي بتدور عليها مش موجودة أو الرابط غلط.</p>
-                <a href="/" class="btn btn-primary w-100 py-3 fs-5 rounded-pill"><i class="bi bi-house me-2"></i> ارجع للورشة</a>
-            </div>
-        </div>
-        """
-        return HTMLResponse(render_html_layout(content, "صفحة مفقودة"), status_code=404)
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(content=b"", media_type="image/x-icon")
-
-async def get_current_user_from_cookie(request: Request, db: AsyncSession = Depends(get_db)):
-    token = request.cookies.get("access_token")
-    if not token: return None
-    try:
-        payload = jwt.decode(token.replace("Bearer ", ""), SECRET_KEY, algorithms=[ALGORITHM])
-        user = (await db.execute(select(User).where(User.username == payload.get("sub")))).scalars().first()
-        if user:
-            user.tenant = await get_tenant_cached(user.tenant_id, db)
-        return user
-    except: return None
-
-@app.get("/health")
-async def health_check(db: AsyncSession = Depends(get_db)):
-    try:
-        await db.execute(text("SELECT 1"))
-        db_status = "Connected"
-    except Exception as e:
-        db_status = f"Error: {e}"
-    pinecone_status = "Connected (Singleton)" if pc_client_instance else "Not Initialized"
-    return {"status": "OK", "database": db_status, "pinecone": pinecone_status}
-
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user: return RedirectResponse(url="/chat")
-    return RedirectResponse(url="/login")
-
-@app.get("/login", response_class=HTMLResponse)
-async def login_page():
-    content = """
-    <div class="card shadow-lg mx-auto" style="max-width: 400px; margin-top: 10vh;">
-        <div class="card-body p-4 text-center">
-            <i class="bi bi-tools display-1" style="color: #FF9800;"></i>
-            <h2 class="fw-bold my-3 text-white">دخول الورشة</h2>
-            <form action="/login" method="post">
-                <input type="text" class="form-control mb-3 text-center" name="username" required placeholder="اسم المستخدم (worker / admin)">
-                <input type="password" class="form-control mb-4 text-center" name="password" required placeholder="كلمة السر">
-                <button type="submit" class="btn btn-primary w-100 py-3 fs-4 rounded-pill">دخول <i class="bi bi-box-arrow-in-left"></i></button>
-            </form>
-        </div>
-    </div>
-    """
-    return render_html_layout(content, "الدخول")
-
-@app.post("/login")
-async def login_post(username: str = Form(...), password: str = Form(...), db: AsyncSession = Depends(get_db)):
-    user = (await db.execute(select(User).where(User.username == username))).scalars().first()
-    if not user or not verify_password(password, user.hashed_password):
-        return HTMLResponse(render_html_layout("<div class='alert alert-danger text-center'>بيانات خطأ</div>", "خطأ"))
-    access_token = create_access_token(data={"sub": user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    res = RedirectResponse(url="/chat", status_code=303)
-    
-    # 1. إعداد الـ Cookie بشكل آمن للـ Production
-    res.set_cookie(key="access_token", value=f"Bearer {access_token}", httponly=True, secure=IS_PRODUCTION, samesite="lax")
-    return res
-
-@app.get("/logout")
-async def logout():
-    res = RedirectResponse(url="/login")
-    res.delete_cookie("access_token")
-    return res
-
-# =====================================================================
-# 7. لوحة التحكم للمدير (Dashboard)
-# =====================================================================
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user or user.role != "admin": return RedirectResponse(url="/chat")
-    
-    # 3. تحسين الأداء بجلب العد فقط دون تحميل البيانات في الذاكرة
-    chats_count_result = await db.execute(select(func.count()).where(ConversationHistory.tenant_id == user.tenant_id))
-    chats_count = chats_count_result.scalar() or 0
-    
-    workers_count_result = await db.execute(select(func.count()).where(User.tenant_id == user.tenant_id, User.role == 'worker'))
-    workers_count = workers_count_result.scalar() or 0
-    
-    alerts = (await db.execute(select(Alert).where(Alert.tenant_id == user.tenant_id).order_by(Alert.created_at.desc()).limit(5))).scalars().all()
-    
-    alerts_html = "".join([f"<li class='list-group-item bg-dark text-danger border-secondary'><i class='bi bi-exclamation-triangle-fill me-2'></i> [{a.created_at.strftime('%Y-%m-%d')}] {a.message}</li>" for a in alerts])
-    if not alerts: alerts_html = "<li class='list-group-item bg-dark text-muted border-secondary text-center'>لا توجد تنبيهات لأعطال متكررة مؤخراً. الوضع مستقر!</li>"
-
-    content = f"""
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-white m-0"><i class="bi bi-speedometer2 text-primary me-2"></i> لوحة تحكم الورشة</h2>
-    </div>
-    
-    <div class="row g-4 mb-4">
-        <div class="col-md-4">
-            <div class="card text-center h-100 border-0 bg-dark">
-                <div class="card-body">
-                    <i class="bi bi-chat-dots display-4 text-warning mb-3"></i>
-                    <h3 class="text-white fw-bold">{chats_count}</h3>
-                    <p class="text-muted mb-0">إجمالي الرسائل والاستفسارات</p>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-4">
-            <div class="card text-center h-100 border-0 bg-dark">
-                <div class="card-body">
-                    <i class="bi bi-people display-4 text-info mb-3"></i>
-                    <h3 class="text-white fw-bold">{workers_count}</h3>
-                    <p class="text-muted mb-0">عدد العمال المسجلين</p>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-4">
-            <div class="card text-center h-100 border-0 bg-dark">
-                <div class="card-body">
-                    <i class="bi bi-cash-coin display-4 text-success mb-3"></i>
-                    <h3 class="text-white fw-bold">--</h3>
-                    <p class="text-muted mb-0">تكلفة الـ API (راجع مزود الخدمة)</p>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="card border-0">
-        <div class="card-header text-danger"><i class="bi bi-bell-fill me-2"></i> التنبيهات الذكية (الأعطال المتكررة)</div>
-        <ul class="list-group list-group-flush">
-            {alerts_html}
-        </ul>
-    </div>
-    """
-    return render_html_layout(content, "لوحة التحكم", user)
-
-@app.get("/users", response_class=HTMLResponse)
-async def users_page(request: Request, msg: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user or user.role != "admin": return RedirectResponse(url="/chat")
-    
-    workers = (await db.execute(select(User).where(User.tenant_id == user.tenant_id))).scalars().all()
-    workers_html = ""
-    for w in workers:
-        role_badge = "<span class='badge bg-danger'>مدير</span>" if w.role == 'admin' else "<span class='badge bg-primary'>عامل</span>"
-        workers_html += f"""
-        <tr>
-            <td class="text-white">{w.username}</td>
-            <td>{role_badge}</td>
-            <td>
-                <form action="/api/users/delete/{w.id}" method="post" class="d-inline">
-                    <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('هل تريد حذف المستخدم؟')"><i class="bi bi-trash"></i></button>
-                </form>
-            </td>
-        </tr>
-        """
-
-    content = f"""
-    <h2 class="text-white mb-4"><i class="bi bi-people text-info me-2"></i> إدارة العمال والصنايعية</h2>
-    <div class="row g-4">
-        <div class="col-md-4">
-            <div class="card border-0">
-                <div class="card-header text-success"><i class="bi bi-person-plus me-2"></i> إضافة عامل جديد</div>
-                <div class="card-body">
-                    <form action="/api/users/add" method="post">
-                        <input type="text" name="username" class="form-control mb-3" placeholder="اسم المستخدم" required>
-                        <input type="password" name="password" class="form-control mb-3" placeholder="كلمة السر" required>
-                        <select name="role" class="form-select mb-3">
-                            <option value="worker">عامل (يستخدم المحادثة فقط)</option>
-                            <option value="admin">مدير (صلاحيات كاملة)</option>
-                        </select>
-                        <button type="submit" class="btn btn-success w-100">إضافة المستخدم</button>
-                    </form>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-8">
-            <div class="card border-0">
-                <div class="card-header text-primary"><i class="bi bi-list-task me-2"></i> قائمة المستخدمين</div>
-                <div class="card-body p-0 table-responsive">
-                    <table class="table table-dark table-hover mb-0">
-                        <thead><tr><th>اسم المستخدم</th><th>الصلاحية</th><th>إجراءات</th></tr></thead>
-                        <tbody>{workers_html}</tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-    """
-    return render_html_layout(content, "إدارة العمال", user)
-
-@app.post("/api/users/add")
-async def add_user(request: Request, username: str = Form(...), password: str = Form(...), role: str = Form(...), db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user and user.role == "admin":
-        existing = (await db.execute(select(User).where(User.username == username))).scalars().first()
-        if not existing:
-            new_user = User(username=username, hashed_password=get_password_hash(password), role=role, tenant_id=user.tenant_id)
-            db.add(new_user)
-            await db.commit()
-    return RedirectResponse(url="/users", status_code=303)
-
-@app.post("/api/users/delete/{user_id}")
-async def delete_user(user_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user and user.role == "admin":
-        target = (await db.execute(select(User).where(User.id == user_id, User.tenant_id == user.tenant_id))).scalars().first()
-        if target and target.id != user.id:
-            await db.delete(target)
-            await db.commit()
-    return RedirectResponse(url="/users", status_code=303)
-
-# =====================================================================
-# الإعدادات المخصصة والتخصيص
-# =====================================================================
-@app.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request, msg: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user or user.role != "admin": return RedirectResponse(url="/chat")
-    t = user.tenant
-    
-    alerts = {
-        "llm_success": "<div class='alert alert-success alert-dismissible fade show mb-4'><i class='bi bi-check-circle me-2'></i> تم حفظ إعدادات النماذج (LLM) بنجاح.</div>",
-        "pinecone_success": "<div class='alert alert-success alert-dismissible fade show mb-4'><i class='bi bi-check-circle me-2'></i> تم حفظ إعدادات الذاكرة (Pinecone) بنجاح.</div>",
-        "prompt_success": "<div class='alert alert-success alert-dismissible fade show mb-4'><i class='bi bi-check-circle me-2'></i> تم تحديث شخصية الأسطى بنجاح.</div>",
-        "error": "<div class='alert alert-danger alert-dismissible fade show mb-4'><i class='bi bi-exclamation-triangle me-2'></i> حدث خطأ أثناء الحفظ. تأكد من إدخال البيانات بصورة صحيحة.</div>"
-    }
-    alert_html = alerts.get(msg, "")
-    
-    dec_openai = decrypt_val(t.openai_api_key)
-    dec_anthropic = decrypt_val(t.anthropic_api_key)
-    dec_google = decrypt_val(t.google_api_key)
-    dec_pinecone = decrypt_val(t.pinecone_api_key)
-    base_url_val = getattr(t, 'api_base_url', '')
-    
-    content = f"""
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-white m-0"><i class="bi bi-gear text-warning me-2"></i> إعدادات النظام والتخصيص</h2>
-    </div>
-    
-    {alert_html}
-    
-    <div class="row g-4">
-        <div class="col-lg-6">
-            <div class="card h-100 border-0">
-                <div class="card-header text-warning"><i class="bi bi-cpu me-2"></i> إعدادات النماذج الحرة (LLMs)</div>
-                <div class="card-body">
-                    <form action="/api/settings/save_llm" method="post">
-                        <div class="mb-3">
-                            <label class="form-label text-light fw-bold">مزود الخدمة (Provider)</label>
-                            <select name="llm_provider" class="form-select mb-2">
-                                <option value="google" {'selected' if t.llm_provider == 'google' else ''}>Google (Gemini)</option>
-                                <option value="openai" {'selected' if t.llm_provider == 'openai' else ''}>OpenAI (ChatGPT)</option>
-                                <option value="anthropic" {'selected' if t.llm_provider == 'anthropic' else ''}>Anthropic (Claude)</option>
-                                <option value="custom" {'selected' if t.llm_provider == 'custom' else ''}>مزود خارجي متوافق مع OpenAI (مثل Local / Groq)</option>
-                            </select>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label text-light fw-bold">اسم الموديل (اكتبه يدوياً بدقة)</label>
-                            <input type="text" name="llm_model" class="form-control dir-ltr" value="{t.llm_model}" placeholder="مثال: gemini-1.5-flash أو gpt-4o" required>
-                            <small class="text-muted">ملاحظة: يمكنك إدخال أي اسم موديل تريده بحرية تامة.</small>
-                        </div>
-                        <div class="mb-4">
-                            <label class="form-label text-light fw-bold">الرابط المخصص / Base URL (اختياري)</label>
-                            <input type="text" name="api_base_url" class="form-control dir-ltr" value="{base_url_val}" placeholder="اتركه فارغاً للوضع الافتراضي">
-                        </div>
-                        
-                        <hr class="border-secondary">
-                        <div class="mb-3">
-                            <label class="form-label text-light fw-bold">مفتاح OpenAI (مطلوب للصوت)</label>
-                            <div class="input-group">
-                                <input type="password" name="openai_key" id="openai_key" class="form-control dir-ltr" placeholder="sk-proj-..." value="{dec_openai}">
-                                <button class="btn btn-outline-secondary bg-dark text-white border-secondary" type="button" onclick="toggleVisibility('openai_key', this)"><i class="bi bi-eye"></i></button>
-                            </div>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label text-light fw-bold">مفتاح Anthropic</label>
-                            <div class="input-group">
-                                <input type="password" name="anthropic_key" id="anthropic_key" class="form-control dir-ltr" placeholder="sk-ant-..." value="{dec_anthropic}">
-                                <button class="btn btn-outline-secondary bg-dark text-white border-secondary" type="button" onclick="toggleVisibility('anthropic_key', this)"><i class="bi bi-eye"></i></button>
-                            </div>
-                        </div>
-                        <div class="mb-4">
-                            <label class="form-label text-light fw-bold">مفتاح Google Gemini</label>
-                            <div class="input-group">
-                                <input type="password" name="google_key" id="google_key" class="form-control dir-ltr" placeholder="AIza..." value="{dec_google}">
-                                <button class="btn btn-outline-secondary bg-dark text-white border-secondary" type="button" onclick="toggleVisibility('google_key', this)"><i class="bi bi-eye"></i></button>
-                            </div>
-                        </div>
-                        <button type="submit" class="btn btn-primary w-100 py-2"><i class="bi bi-save me-2"></i> حفظ إعدادات الموديل</button>
-                    </form>
-                </div>
-            </div>
-        </div>
-        
-        <div class="col-lg-6">
-            <div class="card h-100 border-0">
-                <div class="card-header text-info"><i class="bi bi-database me-2"></i> الذاكرة والكتالوجات (Pinecone)</div>
-                <div class="card-body">
-                    <div class="alert alert-dark text-light small border-secondary mb-3">
-                        <i class="bi bi-info-circle text-info me-1"></i> 
-                        إذا لم تضع مفتاح OpenAI، سيتم استخدام مفتاح <strong>جيميناي (Google)</strong> تلقائياً لتضمين الكتالوجات.
-                    </div>
-                    <form action="/api/settings/save_pinecone" method="post">
-                        <div class="mb-3">
-                            <label class="form-label text-light fw-bold">Pinecone API Key</label>
-                            <div class="input-group">
-                                <input type="password" name="pinecone_key" id="pinecone_key" class="form-control dir-ltr" placeholder="pc-sk-..." value="{dec_pinecone}">
-                                <button class="btn btn-outline-secondary bg-dark text-white border-secondary" type="button" onclick="toggleVisibility('pinecone_key', this)"><i class="bi bi-eye"></i></button>
-                            </div>
-                        </div>
-                        <div class="mb-4">
-                            <label class="form-label text-light fw-bold">اسم الفهرس (Pinecone Index Name)</label>
-                            <input type="text" name="pinecone_index" class="form-control dir-ltr" placeholder="workshop-index" value="{t.pinecone_index}">
-                        </div>
-                        <button type="submit" class="btn btn-info w-100 py-2 fw-bold"><i class="bi bi-hdd-network me-2"></i> حفظ إعدادات الذاكرة</button>
-                    </form>
-                </div>
-            </div>
-        </div>
-        
-        <div class="col-lg-12">
-            <div class="card border-0 mb-4">
-                <div class="card-header text-success"><i class="bi bi-person-workspace me-2"></i> شخصية المساعد (System Prompt)</div>
-                <div class="card-body">
-                    <form action="/api/settings/save_prompt" method="post">
-                        <textarea name="workshop_prompt" class="form-control mb-3" style="min-height: 150px;">{t.workshop_prompt}</textarea>
-                        <button type="submit" class="btn btn-success w-100 py-2 fw-bold text-dark"><i class="bi bi-person-check me-2"></i> تحديث الشخصية</button>
-                    </form>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <script>
-        function toggleVisibility(inputId, btnElement) {{
-            var input = document.getElementById(inputId);
-            var icon = btnElement.querySelector('i');
-            if (input.type === "password") {{
-                input.type = "text";
-                icon.classList.remove('bi-eye');
-                icon.classList.add('bi-eye-slash');
-            }} else {{
-                input.type = "password";
-                icon.classList.remove('bi-eye-slash');
-                icon.classList.add('bi-eye');
-            }}
-        }}
-    </script>
-    """
-    return render_html_layout(content, "الإعدادات", user)
-
-@app.post("/api/settings/save_llm")
-async def save_llm(request: Request, llm_provider: str = Form(...), llm_model: str = Form(...), api_base_url: str = Form(""), openai_key: str = Form(""), anthropic_key: str = Form(""), google_key: str = Form(""), db: AsyncSession = Depends(get_db)):
-    try:
-        user = await get_current_user_from_cookie(request, db)
-        if user and user.role == "admin":
-            user.tenant.llm_provider = llm_provider
-            user.tenant.llm_model = llm_model
-            
-            # التأكد من وجود الحقل قبل الحفظ (للتوافق مع قواعد البيانات القديمة)
-            if hasattr(user.tenant, 'api_base_url'):
-                user.tenant.api_base_url = api_base_url
-                
-            user.tenant.openai_api_key = encrypt_val(openai_key)
-            user.tenant.anthropic_api_key = encrypt_val(anthropic_key)
-            user.tenant.google_api_key = encrypt_val(google_key)
-            with tenant_cache_lock:
-                if user.tenant_id in tenant_cache:
-                    del tenant_cache[user.tenant_id]
-            await db.commit()
-            logger.info(f"USER_ACTION | user={user.username} | tenant={user.tenant_id} | action=save_llm_settings")
-        return RedirectResponse(url="/settings?msg=llm_success", status_code=303)
-    except Exception as e:
-        logger.error(f"Error saving LLM settings: {e}")
-        return RedirectResponse(url="/settings?msg=error", status_code=303)
-
-@app.post("/api/settings/save_pinecone")
-async def save_pinecone(request: Request, pinecone_key: str = Form(""), pinecone_index: str = Form(""), db: AsyncSession = Depends(get_db)):
-    global pc_client_instance
-    try:
-        user = await get_current_user_from_cookie(request, db)
-        if user and user.role == "admin":
-            user.tenant.pinecone_api_key = encrypt_val(pinecone_key)
-            if pinecone_key: 
-                pc_client_instance = PineconeClient(api_key=pinecone_key)
-            else:
-                pc_client_instance = None
-            user.tenant.pinecone_index = pinecone_index
-            with tenant_cache_lock:
-                if user.tenant_id in tenant_cache:
-                    del tenant_cache[user.tenant_id]
-            await db.commit()
-            logger.info(f"USER_ACTION | user={user.username} | tenant={user.tenant_id} | action=save_pinecone_settings")
-        return RedirectResponse(url="/settings?msg=pinecone_success", status_code=303)
-    except Exception:
-        return RedirectResponse(url="/settings?msg=error", status_code=303)
-
-@app.post("/api/settings/save_prompt")
-async def save_prompt(request: Request, workshop_prompt: str = Form(...), db: AsyncSession = Depends(get_db)):
-    try:
-        user = await get_current_user_from_cookie(request, db)
-        if user and user.role == "admin":
-            user.tenant.workshop_prompt = workshop_prompt
-            with tenant_cache_lock:
-                if user.tenant_id in tenant_cache:
-                    del tenant_cache[user.tenant_id]
-            await db.commit()
-        return RedirectResponse(url="/settings?msg=prompt_success", status_code=303)
-    except Exception:
-        return RedirectResponse(url="/settings?msg=error", status_code=303)
-
-# =====================================================================
-# إدارة البيانات والكتالوجات المرفوعة
-# =====================================================================
-async def process_rag_document_bg(file_content: bytes, filename: str, tenant_id: int):
-    async with AsyncSessionLocal() as db:
-        try:
-            tenant = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalars().first()
-            openai_key = decrypt_val(tenant.openai_api_key)
-            google_key = decrypt_val(tenant.google_api_key)
-            pinecone_key = decrypt_val(tenant.pinecone_api_key)
-            
-            if not tenant or not pinecone_key or not pc_client_instance or not tenant.pinecone_index: return
-
-            embeddings = None
-            if openai_key:
-                embeddings = OpenAIEmbeddings(openai_api_key=openai_key)
-            elif google_key:
-                embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_key)
-            if not embeddings: return
-
-            text_data = ""
-            if filename.lower().endswith('.pdf'):
-                pdf_reader = PdfReader(io.BytesIO(file_content))
-                for page in pdf_reader.pages: text_data += (page.extract_text() or "") + "\n"
-            else: text_data = file_content.decode('utf-8')
-                
-            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100).split_text(text_data)
-            metadatas = [{"filename": filename} for _ in chunks]
-            vector_store = PineconeVectorStore(index=pc_client_instance.Index(tenant.pinecone_index), embedding=embeddings, namespace=f"tenant_{tenant_id}")
-            vector_store.add_texts(texts=chunks, metadatas=metadatas)
-        except Exception as e: logger.error(f"RAG Error: {e}")
-
-@app.get("/data_management", response_class=HTMLResponse)
-async def data_management_page(request: Request, msg: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user or user.role != "admin": return RedirectResponse(url="/chat")
-    
-    docs = (await db.execute(select(UploadedDocument).where(UploadedDocument.tenant_id == user.tenant_id).order_by(UploadedDocument.id.desc()))).scalars().all()
-    docs_html = ""
-    for d in docs:
-        docs_html += f"""
-        <li class="list-group-item d-flex justify-content-between align-items-center bg-dark text-white border-secondary mb-2 rounded">
-            <span><i class="bi bi-file-earmark-text text-warning me-3 fs-5"></i> {d.filename}</span>
-            <form action="/api/delete_rag/{d.id}" method="post" class="m-0">
-                <button type="submit" class="btn btn-outline-danger btn-sm px-3" onclick="return confirm('هل أنت متأكد من حذف هذا الكتالوج؟')"><i class="bi bi-trash"></i> حذف</button>
-            </form>
-        </li>
-        """
-    if not docs: docs_html = "<div class='text-center text-muted my-4'><i class='bi bi-inbox fs-1'></i><br>لا توجد كتالوجات مرفوعة حالياً.</div>"
-
-    alert_html = ""
-    if msg == "error_size": alert_html = "<div class='alert alert-danger'>حجم الملف يتعدى الحد الأقصى (20 ميجابايت).</div>"
-    elif msg == "error_type": alert_html = "<div class='alert alert-danger'>صيغة الملف غير مدعومة. فقط PDF أو TXT مسموح.</div>"
-    elif msg == "duplicate": alert_html = "<div class='alert alert-warning'>الملف ده اترفع قبل كده يا هندسة، مفيش داعي للتكرار.</div>"
-
-    content = f"""
-    {alert_html}
-    <div class="row g-4">
-        <div class="col-lg-5">
-            <div class="card p-4 h-100 border-0">
-                <div class="text-center mb-4">
-                    <i class="bi bi-cloud-arrow-up display-1 text-primary"></i>
-                    <h4 class="text-white mt-3">رفع الكتالوجات (متعدد)</h4>
-                    <p class="text-muted small">يمكنك اختيار ملفات PDF أو TXT (الحد الأقصى 20 ميجا للملف).</p>
-                </div>
-                <form action="/api/upload_rag" method="post" enctype="multipart/form-data">
-                    <input class="form-control form-control-lg mb-4 bg-dark text-white border-secondary" type="file" name="files" multiple accept=".pdf, .txt" required>
-                    <button type="submit" class="btn btn-primary w-100 py-3 fs-5 fw-bold rounded-pill"><i class="bi bi-upload me-2"></i> ارفع وعلم المساعد</button>
-                </form>
-            </div>
-        </div>
-        <div class="col-lg-7">
-            <div class="card p-4 h-100 border-0">
-                <h4 class="text-white mb-4 border-bottom border-secondary pb-3"><i class="bi bi-folder-fill text-warning me-2"></i> الملفات والكتالوجات المخزنة</h4>
-                <ul class="list-group list-group-flush" style="max-height: 400px; overflow-y: auto; padding-right: 5px;">
-                    {docs_html}
-                </ul>
-            </div>
-        </div>
-    </div>
-    """
-    return render_html_layout(content, "الكتالوجات", user)
-
-@app.post("/api/upload_rag")
-async def upload_rag_api(request: Request, background_tasks: BackgroundTasks, files: List[UploadFile] = File(...), db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user and user.role == "admin":
-        MAX_FILE_SIZE = 20 * 1024 * 1024
-        for file in files:
-            # 5. منع التكرار
-            existing_doc = (await db.execute(select(UploadedDocument).where(UploadedDocument.filename == file.filename, UploadedDocument.tenant_id == user.tenant_id))).scalars().first()
-            if existing_doc:
-                return RedirectResponse(url="/data_management?msg=duplicate", status_code=303)
-                
-            content = await file.read()
-            if len(content) > MAX_FILE_SIZE: return RedirectResponse(url="/data_management?msg=error_size", status_code=303)
-            try:
-                if MAGIC_AVAILABLE: mime_type = magic.from_buffer(content, mime=True)
-                else:
-                    mime_type, _ = mimetypes.guess_type(file.filename)
-                    if not mime_type: mime_type = "application/octet-stream"
-                if mime_type not in ["application/pdf", "text/plain"]: return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
-            except Exception:
-                if not (file.filename.lower().endswith('.pdf') or file.filename.lower().endswith('.txt')):
-                     return RedirectResponse(url="/data_management?msg=error_type", status_code=303)
-
-            new_doc = UploadedDocument(filename=file.filename, tenant_id=user.tenant_id)
-            db.add(new_doc)
-            await db.commit()
-            logger.info(f"USER_ACTION | user={user.username} | tenant={user.tenant_id} | action=upload_doc | file={file.filename}")
-            background_tasks.add_task(process_rag_document_bg, content, file.filename, user.tenant_id)
-        return RedirectResponse(url="/data_management", status_code=303)
-    return RedirectResponse(url="/data_management")
-
-# 2. تغيير مسار الحذف ليكون POST لمنع ثغرات الـ CSRF
-@app.post("/api/delete_rag/{doc_id}")
-async def delete_rag_api(doc_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user and user.role == "admin":
-        doc = (await db.execute(select(UploadedDocument).where(UploadedDocument.id == doc_id, UploadedDocument.tenant_id == user.tenant_id))).scalars().first()
-        if doc:
-            tenant = user.tenant
-            if pc_client_instance and tenant.pinecone_index:
-                try:
-                    idx = pc_client_instance.Index(tenant.pinecone_index)
-                    idx.delete(filter={"filename": doc.filename}, namespace=f"tenant_{tenant.id}")
-                except Exception as e: logger.error(f"Failed to delete from Pinecone: {e}")
-            await db.delete(doc)
-            await db.commit()
-            logger.info(f"USER_ACTION | user={user.username} | tenant={user.tenant_id} | action=delete_doc | doc_id={doc_id}")
-    return RedirectResponse(url="/data_management", status_code=303)
-
-# =====================================================================
-# إدارة جلسات المحادثة (إعادة تسمية / حذف)
-# =====================================================================
-@app.post("/api/chat/rename/{session_uuid}")
-async def rename_chat_session(session_uuid: str, request: Request, title: str = Form(...), db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user:
-        chat_session = (await db.execute(select(ChatSession).where(ChatSession.session_uuid == session_uuid, ChatSession.user_id == user.id))).scalars().first()
-        if chat_session:
-            chat_session.title = title
-            chat_session.updated_at = datetime.utcnow()
-            await db.commit()
-    return RedirectResponse(url=f"/chat?session={session_uuid}", status_code=303)
-
-@app.post("/api/chat/delete/{session_uuid}")
-async def delete_chat_session(session_uuid: str, request: Request, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if user:
-        chat_session = (await db.execute(select(ChatSession).where(ChatSession.session_uuid == session_uuid, ChatSession.user_id == user.id))).scalars().first()
-        if chat_session:
-            await db.execute(text("DELETE FROM conversation_history WHERE session_id = :sid AND tenant_id = :tid"), {"sid": session_uuid, "tid": user.tenant_id})
-            await db.delete(chat_session)
-            await db.commit()
-    return RedirectResponse(url="/chat", status_code=303)
-
-# =====================================================================
-# واجهة الـ Kiosk ودردشة العمال
-# =====================================================================
-@app.get("/chat", response_class=HTMLResponse)
-async def kiosk_chat_page(request: Request, session: Optional[str] = None, new: Optional[int] = None, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user: return RedirectResponse(url="/login")
-    
-    # 1. جلب أو إنشاء جلسات المحادثة (Chat Sessions)
-    sessions_result = await db.execute(select(ChatSession).where(ChatSession.user_id == user.id).order_by(ChatSession.updated_at.desc()))
-    user_sessions = sessions_result.scalars().all()
-
-    current_session = None
-
-    if new == 1:
-        new_sess = ChatSession(user_id=user.id, tenant_id=user.tenant_id, title="محادثة جديدة")
-        db.add(new_sess)
-        await db.commit()
-        await db.refresh(new_sess)
-        return RedirectResponse(url=f"/chat?session={new_sess.session_uuid}")
-
-    if session:
-        current_session = (await db.execute(select(ChatSession).where(ChatSession.session_uuid == session, ChatSession.user_id == user.id))).scalars().first()
-    
-    if not current_session:
-        if user_sessions:
-            current_session = user_sessions[0]
-        else:
-            new_sess = ChatSession(user_id=user.id, tenant_id=user.tenant_id, title="محادثة جديدة")
-            db.add(new_sess)
-            await db.commit()
-            await db.refresh(new_sess)
-            current_session = new_sess
-            user_sessions = [current_session]
-    
-    current_session_uuid = current_session.session_uuid
-
-    # 2. بناء الـ HTML الخاص بقائمة المحادثات (Sidebar)
-    sessions_html = ""
-    for s in user_sessions:
-        active_class = "active" if s.session_uuid == current_session_uuid else ""
-        sessions_html += f"""
-        <div class="session-item {active_class}">
-            <a href="/chat?session={s.session_uuid}" title="{html.escape(s.title)}">
-                <i class="bi bi-chat-left-text me-2"></i> {html.escape(s.title)}
-            </a>
-            <div class="session-actions">
-                <button onclick="renameSession('{s.session_uuid}', '{html.escape(s.title)}')"><i class="bi bi-pencil"></i></button>
-                <button onclick="deleteSession('{s.session_uuid}')"><i class="bi bi-trash text-danger"></i></button>
-            </div>
-        </div>
-        """
-
-    # 3. جلب تاريخ الرسائل للجلسة الحالية
-    history_result = await db.execute(
-        select(ConversationHistory)
-        .where(ConversationHistory.session_id == current_session_uuid, ConversationHistory.tenant_id == user.tenant_id)
-        .order_by(ConversationHistory.created_at.desc())
-        .limit(50)
-    )
-    chat_history = list(reversed(history_result.scalars().all()))
-
-    history_html = ""
-    for msg in chat_history:
-        if msg.role == "Worker":
-            history_html += f'<div class="bubble user">{msg.content}</div>'
-        else:
-            safe_text = msg.content.replace("\\", "\\\\").replace("'", "\\'").replace('"', '&quot;').replace('\n', ' ')
-            display_content = msg.content.replace('\n', '<br>')
-            history_html += f'''<div class="bubble ai">{display_content}
-            <button class="speak-btn" onclick="speakText(this, '{safe_text}')"><i class="bi bi-volume-up-fill"></i></button>
-            </div>'''
-            
-    content_html = f"""
+import pinecone
+from pinecone import Pinecone
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import fitz  # PyMuPDF
+import edge_tts
+import asyncio
+import os
+import json
+import base64
+import re
+from openai import OpenAI
+
+# ==========================================
+# 1. إعدادات الصفحة وواجهة النيون (CSS)
+# ==========================================
+st.set_page_config(page_title="AI Agent - Neon Chat", page_icon="🤖", layout="wide", initial_sidebar_state="collapsed")
+
+def inject_neon_css():
+    st.markdown("""
     <style>
-        .main-content {{ padding: 0 !important; width: calc(100% - var(--sidebar-width)); height: 100vh; overflow: hidden; display: flex; flex-direction: column; background: #000; position: relative;}}
-        @media (max-width: 992px) {{ .main-content {{ width: 100%; height: calc(100vh - 60px); }} }}
-        
-        /* تنسيقات الشريط الجانبي للمحادثات */
-        .chat-history-sidebar {{
-            position: absolute; top: 0; left: 0; width: 300px; height: 100vh;
-            background: #111; border-right: 1px solid #333; z-index: 1050;
-            transform: translateX(-100%); transition: transform 0.3s ease;
-            display: flex; flex-direction: column; box-shadow: 2px 0 10px rgba(0,0,0,0.5);
-        }}
-        .chat-history-sidebar.show {{ transform: translateX(0); }}
-        .session-item {{ display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid #222; transition: 0.2s; }}
-        .session-item a {{ color: #ccc; text-decoration: none; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 1.1rem; }}
-        .session-item:hover, .session-item.active {{ background: #222; }}
-        .session-item:hover a, .session-item.active a {{ color: var(--primary); font-weight: bold; }}
-        .session-actions {{ display: flex; gap: 15px; margin-right: 10px; }}
-        .session-actions button {{ background: none; border: none; color: #777; cursor: pointer; padding: 0; font-size: 1.1rem; }}
-        .session-actions button:hover {{ color: #fff; transform: scale(1.1); }}
-        .toggle-history-btn {{
-            position: absolute; top: 15px; left: 15px; z-index: 1040;
-            background: rgba(0,0,0,0.7); border: 1px solid #555; color: var(--primary);
-            border-radius: 8px; padding: 8px 15px; font-weight: bold; cursor: pointer;
-            backdrop-filter: blur(5px);
-        }}
-        .toggle-history-btn:hover {{ background: rgba(0,0,0,0.9); color: #fff; border-color: var(--primary); }}
-
-        .chat-area {{ flex: 1; overflow-y: auto; padding: 20px; padding-top: 70px; display: flex; flex-direction: column; gap: 20px; scroll-behavior: smooth; }}
-        .bubble {{ max-width: 90%; padding: 20px; border-radius: 20px; font-size: 1.3rem; font-weight: bold; line-height: 1.6; position: relative; }}
-        .bubble.ai {{ background: #1e1e1e; color: #fff; align-self: flex-start; border-top-right-radius: 5px; border: 2px solid #333; }}
-        .bubble.user {{ background: var(--primary); color: #000; align-self: flex-end; border-top-left-radius: 5px; }}
-        .bubble img {{ max-width: 250px; max-height: 250px; object-fit: contain; border-radius: 10px; margin-top: 10px; border: 1px solid #444; background: #000; }}
-        .audio-wave {{ display: inline-block; width: 30px; height: 15px; background: url('https://i.imgur.com/3vB9V5H.gif') center/cover; }}
-        .speak-btn {{ position: absolute; bottom: -15px; left: -15px; background: #00bcd4; color: #000; border: none; border-radius: 50%; width: 45px; height: 45px; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); z-index: 10;}}
-        .speak-btn:active {{ transform: scale(0.9); }}
-        .speak-btn.playing {{ background: #f44336; color: #fff; animation: pulse-red 1s infinite; }}
-        .controls-area {{ background: #111; padding: 20px; display: flex; gap: 15px; border-top: 2px solid #333; align-items: center; }}
-        .kiosk-btn {{ flex: 1; border: none; border-radius: 20px; height: 80px; font-size: 2rem; font-weight: 900; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.1s; user-select: none; -webkit-user-select: none; }}
-        .kiosk-btn:active {{ transform: scale(0.95); }}
-        .btn-mic {{ background: #FF9800; color: #000; touch-action: none; }}
-        .btn-camera {{ background: #2196F3; color: #fff; flex: 0.3; }}
-        .chat-input {{ flex: 1; display: none; background: #222; border: 2px solid #444; color: #fff; border-radius: 20px; padding: 15px; font-size: 1.5rem; }}
-        .btn-keyboard {{ background: transparent; border: none; color: #888; font-size: 2rem; }}
-        @keyframes pulse-red {{ 0% {{ box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.8); }} 70% {{ box-shadow: 0 0 0 25px rgba(244, 67, 54, 0); }} 100% {{ box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }} }}
+        /* خلفية داكنة جداً */
+        .stApp {
+            background-color: #09090b;
+            color: #e0e0e0;
+        }
+        /* تصميم الأزرار النيون */
+        .stButton>button {
+            background-color: transparent !important;
+            color: #00f3ff !important;
+            border: 2px solid #00f3ff !important;
+            border-radius: 15px !important;
+            box-shadow: 0 0 10px #00f3ff, inset 0 0 5px #00f3ff !important;
+            transition: all 0.3s ease;
+            font-weight: bold;
+            font-size: 16px;
+            width: 100%;
+        }
+        .stButton>button:hover {
+            background-color: #00f3ff !important;
+            color: #000 !important;
+            box-shadow: 0 0 20px #00f3ff, inset 0 0 10px #00f3ff !important;
+        }
+        /* حقول الإدخال */
+        .stTextInput>div>div>input, .stSelectbox>div>div>div, .stTextArea>div>textarea {
+            background-color: #16161a !important;
+            color: #00f3ff !important;
+            border: 1px solid #bc13fe !important;
+            border-radius: 10px;
+            box-shadow: inset 0 0 5px #bc13fe;
+        }
+        /* رسائل الشات */
+        .user-msg {
+            background: linear-gradient(135deg, #bc13fe, #8a2be2);
+            color: white;
+            padding: 15px;
+            border-radius: 20px 20px 0px 20px;
+            margin-bottom: 10px;
+            width: fit-content;
+            max-width: 80%;
+            margin-left: auto;
+            box-shadow: 0 4px 15px rgba(188, 19, 254, 0.4);
+            font-size: 18px;
+        }
+        .bot-msg {
+            background: linear-gradient(135deg, #00f3ff, #0088ff);
+            color: black;
+            padding: 15px;
+            border-radius: 20px 20px 20px 0px;
+            margin-bottom: 10px;
+            width: fit-content;
+            max-width: 80%;
+            margin-right: auto;
+            box-shadow: 0 4px 15px rgba(0, 243, 255, 0.4);
+            font-size: 18px;
+            font-weight: bold;
+        }
+        /* إخفاء القوائم العلوية لستريملت لتبدو كتطبيق حقيقي */
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
     </style>
+    """, unsafe_allow_html=True)
 
-    <!-- زر فتح السجل -->
-    <button class="toggle-history-btn" onclick="document.getElementById('chat-history-sidebar').classList.toggle('show')">
-        <i class="bi bi-layout-sidebar-inset"></i> سجل المحادثات
-    </button>
+inject_neon_css()
 
-    <!-- القائمة الجانبية للسجل -->
-    <div id="chat-history-sidebar" class="chat-history-sidebar">
-       <div class="p-3 border-bottom border-secondary d-flex justify-content-between align-items-center bg-dark">
-           <h5 class="m-0 text-white"><i class="bi bi-clock-history text-primary me-2"></i> المحادثات</h5>
-           <a href="/chat?new=1" class="btn btn-sm btn-primary fw-bold"><i class="bi bi-plus-lg"></i> جديدة</a>
-       </div>
-       <div style="overflow-y: auto; flex: 1;">
-           {sessions_html}
-       </div>
-       <button class="btn btn-outline-secondary m-3" onclick="document.getElementById('chat-history-sidebar').classList.remove('show')">إغلاق <i class="bi bi-x"></i></button>
-    </div>
-
-    <div class="chat-area" id="chatBox">
-        <div class="bubble ai mt-2">
-            <i class="bi bi-robot text-warning me-2 fs-1"></i> يا هلا بالصنايعية رجالة الورشة! 
-            <br>عشان تبعت رسالة صوتية، <strong>اضغط باستمرار</strong> على المايك البرتقالي تحت، اتكلم براحتك ولما تخلص شيل صباعك عشان يتبعت.
-            <button class="speak-btn" onclick="speakText(this, 'يا هلا بالصنايعية رجالة الورشة! عشان تبعت رسالة صوتية، اضغط باستمرار على المايك البرتقالي تحت، اتكلم براحتك ولما تخلص شيل صباعك عشان يتبعت.')"><i class="bi bi-volume-up-fill"></i></button>
-        </div>
-        """ + history_html + """
-    </div>
-    
-    <div id="image-preview-container" style="display:none; padding: 15px 20px; background: #111; text-align: right; border-top: 1px solid #333;">
-        <div style="display: inline-block; position: relative;">
-            <img id="image-preview" src="" style="width: 80px; height: 80px; object-fit: cover; border-radius: 12px; border: 2px solid #555; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
-            <button class="btn btn-danger btn-sm" onclick="cancelImage()" style="position: absolute; top: -8px; right: -8px; border-radius: 50%; width: 26px; height: 26px; padding: 0; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,0,0,0.5);"><i class="bi bi-x"></i></button>
-        </div>
-    </div>
-
-    <div class="controls-area">
-        <button class="btn-keyboard" onclick="toggleKeyboard()"><i class="bi bi-keyboard"></i></button>
-        <input type="text" id="chatInput" class="chat-input" placeholder="اكتب سؤالك هنا..." onkeypress="if(event.key === 'Enter') sendMessage()">
-        <input type="file" id="hidden-camera-input" accept="image/*" style="display:none;" onchange="handleImageSelect(event)">
-        <button class="kiosk-btn btn-camera" onclick="openCamera()"><i class="bi bi-camera-fill"></i></button>
-        <button id="micBtn" class="kiosk-btn btn-mic"><i class="bi bi-mic-fill me-2"></i> اضغط باستمرار للتسجيل</button>
-        <button id="sendTextBtn" class="kiosk-btn btn-mic" style="display:none; background:#4CAF50; color:#fff;" onclick="sendMessage()"><i class="bi bi-send-fill me-2"></i> إرسال</button>
-    </div>
-    """
-    
-    content_js = f"""
-    <script>
-        const currentSessionUuid = '{current_session_uuid}';
-
-        // دوال التحكم في جلسات المحادثة
-        async function renameSession(uuid, currentTitle) {{
-            const newTitle = prompt("أدخل الاسم الجديد للمحادثة:", currentTitle);
-            if (newTitle && newTitle.trim() !== "" && newTitle !== currentTitle) {{
-                const fd = new FormData();
-                fd.append("title", newTitle);
-                await fetch(`/api/chat/rename/${{uuid}}`, {{ method: 'POST', body: fd }});
-                window.location.reload();
-            }}
-        }}
-
-        async function deleteSession(uuid) {{
-            if (confirm("هل أنت متأكد من حذف هذه المحادثة بالكامل؟")) {{
-                await fetch(`/api/chat/delete/${{uuid}}`, {{ method: 'POST' }});
-                window.location.href = '/chat';
-            }}
-        }}
-
-        const chatBox = document.getElementById('chatBox');
-        
-        // Auto-scroll to bottom on load if there's history
-        setTimeout(() => chatBox.scrollTop = chatBox.scrollHeight, 100);
-        
-        const micBtn = document.getElementById('micBtn');
-        const chatInput = document.getElementById('chatInput');
-        const sendTextBtn = document.getElementById('sendTextBtn');
-        const imagePreviewContainer = document.getElementById('image-preview-container');
-        const imagePreview = document.getElementById('image-preview');
-        const cameraInput = document.getElementById('hidden-camera-input');
-        
-        let isRecording = false;
-        let isStarting = false;
-        let mediaRecorder = null;
-        let audioChunks = [];
-        let currentBase64Image = null;
-        let useNativeMic = false;
-        let recognition = null;
-        
-        function openCamera() {{
-            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-            cameraInput.setAttribute('capture', isMobile ? 'environment' : '');
-            cameraInput.click();
-        }}
-
-        class AudioQueue {{
-            constructor() {{ this.queue = []; this.isPlaying = false; }}
-            async add(text, btn) {{
-                this.queue.push({{ text, btn }});
-                if (!this.isPlaying) this.playNext();
-            }}
-            async playNext() {{
-                if (this.queue.length === 0) {{ this.isPlaying = false; return; }}
-                this.isPlaying = true;
-                const {{ text, btn }} = this.queue.shift();
-                await this.processSpeech(btn, text);
-                this.playNext();
-            }}
-            async processSpeech(btnElement, text) {{
-                return new Promise(async (resolve) => {{
-                    if(btnElement) {{
-                        btnElement.classList.add('playing');
-                        btnElement.innerHTML = '<i class="bi bi-stop-fill"></i>';
-                    }}
-                    let cleanText = text.replace(/<[^>]*>?/gm, '').replace(/[*#_]/g, '');
-                    
-                    try {{
-                        const response = await fetch('/api/tts', {{
-                            method: 'POST',
-                            headers: {{ 'Content-Type': 'application/json' }},
-                            body: JSON.stringify({{ text: cleanText }})
-                        }});
-                        if (!response.ok) throw new Error('TTS Backend Failed');
-                        const blob = await response.blob();
-                        const audio = new Audio(URL.createObjectURL(blob));
-                        window.currentAudio = audio;
-                        audio.onended = () => {{ if(btnElement) {{ btnElement.classList.remove('playing'); btnElement.innerHTML = '<i class="bi bi-volume-up-fill"></i>'; }} resolve(); }};
-                        audio.onerror = () => {{ if(btnElement) {{ btnElement.classList.remove('playing'); btnElement.innerHTML = '<i class="bi bi-volume-up-fill"></i>'; }} resolve(); }};
-                        await audio.play();
-                    }} catch (error) {{
-                        if ('speechSynthesis' in window) {{
-                            const utterance = new SpeechSynthesisUtterance(cleanText);
-                            utterance.lang = 'ar-EG'; utterance.rate = 0.9;
-                            utterance.onend = () => {{ if(btnElement) {{ btnElement.classList.remove('playing'); btnElement.innerHTML = '<i class="bi bi-volume-up-fill"></i>'; }} resolve(); }};
-                            window.speechSynthesis.speak(utterance);
-                        }} else {{
-                            resolve();
-                        }}
-                    }}
-                }});
-            }}
-            stop() {{
-                this.queue = []; 
-                this.isPlaying = false;
-                if (window.currentAudio) {{ 
-                    window.currentAudio.pause(); 
-                    window.currentAudio.currentTime = 0;
-                    window.currentAudio = null; 
-                }}
-                if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-                document.querySelectorAll('.speak-btn').forEach(btn => {{
-                    btn.classList.remove('playing');
-                    btn.innerHTML = '<i class="bi bi-volume-up-fill"></i>';
-                }});
-            }}
-        }}
-        const audioQueue = new AudioQueue();
-
-        function speakText(btnElement, text) {{
-            if (btnElement && btnElement.classList.contains('playing')) {{
-                audioQueue.stop();
-                return;
-            }}
-            if (audioQueue.isPlaying) {{
-                audioQueue.stop();
-            }}
-            audioQueue.add(text, btnElement);
-        }}
-
-        function resetMicBtn() {{
-            micBtn.classList.remove('recording', 'bg-danger');
-            micBtn.style.transform = 'scale(1)';
-            micBtn.innerHTML = '<i class="bi bi-mic-fill me-2"></i> اضغط باستمرار للتسجيل';
-        }}
-
-        function startNativeRecording() {{
-            if (isRecording) return;
-            window.SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            if (!window.SpeechRecognition) {{
-                alert("متصفحك لا يدعم المايك الداخلي المجاني، يرجى استخدام متصفح جوجل كروم.");
-                return;
-            }}
-            
-            recognition = new window.SpeechRecognition();
-            recognition.lang = 'ar-EG';
-            recognition.interimResults = true;
-            
-            recognition.onstart = () => {{
-                isRecording = true;
-                micBtn.classList.add('recording', 'bg-danger');
-                micBtn.style.transform = 'scale(1.05)';
-                micBtn.innerHTML = '<i class="bi bi-mic-fill me-2 text-white"></i> جاري الاستماع... ارفع للإرسال';
-                chatInput.value = '';
-                audioQueue.stop();
-            }};
-            
-            recognition.onresult = (e) => {{
-                let text = '';
-                for (let i = e.resultIndex; i < e.results.length; ++i) {{ text += e.results[i][0].transcript; }}
-                chatInput.value = text;
-            }};
-            
-            recognition.onerror = () => {{
-                isRecording = false;
-                resetMicBtn();
-            }};
-            
-            recognition.onend = () => {{
-                isRecording = false;
-                resetMicBtn();
-                if (chatInput.value.trim() !== '') {{
-                    sendMessage(chatInput.value.trim(), null);
-                    chatInput.value = '';
-                }}
-            }};
-            
-            recognition.start();
-        }}
-
-        function stopNativeRecording() {{
-            if (!isRecording) return;
-            if(recognition) recognition.stop();
-            isRecording = false;
-            resetMicBtn();
-        }}
-
-        async function startRecording() {{
-            if (isRecording || isStarting) return;
-            isStarting = true;
-            try {{
-                const stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
-                
-                // حماية: إذا رفع المستخدم يده قبل أن يجهز المايك
-                if (!isStarting) {{
-                    stream.getTracks().forEach(track => track.stop());
-                    return;
-                }}
-                
-                micBtn.classList.add('recording', 'bg-danger');
-                micBtn.style.transform = 'scale(1.05)';
-                micBtn.innerHTML = '<i class="bi bi-mic-fill me-2 text-white"></i> جاري التسجيل... ارفع للإرسال';
-                
-                let options = {{}};
-                if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) options = {{ mimeType: 'audio/webm;codecs=opus' }};
-                else if (MediaRecorder.isTypeSupported('audio/mp4')) options = {{ mimeType: 'audio/mp4' }};
-                
-                mediaRecorder = new MediaRecorder(stream, options);
-                audioChunks = [];
-                mediaRecorder.ondataavailable = e => {{ if (e.data.size > 0) audioChunks.push(e.data); }};
-                
-                mediaRecorder.onstop = () => {{
-                    setTimeout(() => {{
-                        const audioBlob = new Blob(audioChunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
-                        if (audioBlob.size < 1000) {{
-                            const aiDiv = document.createElement('div');
-                            aiDiv.className = 'bubble ai text-danger';
-                            aiDiv.innerHTML = 'الصوت قصير جداً يا هندسة.. دوس باستمرار عشان تسجل';
-                            chatBox.appendChild(aiDiv);
-                            return;
-                        }}
-                        const reader = new FileReader();
-                        reader.readAsDataURL(audioBlob);
-                        reader.onloadend = () => {{ sendMessage(null, reader.result); }};
-                    }}, 300);
-                    stream.getTracks().forEach(track => track.stop());
-                }};
-                
-                mediaRecorder.start();
-                isRecording = true;
-                isStarting = false;
-                audioQueue.stop();
-            }} catch (err) {{ 
-                isStarting = false;
-                alert('عفواً يا هندسة، المتصفح مش قادر يوصل للمايك.'); 
-            }}
-        }}
-
-        function stopRecording() {{
-            isStarting = false;
-            if (!isRecording) return;
-            if(mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-            isRecording = false;
-            resetMicBtn();
-        }}
-
-        // ربط أحداث الضغط والرفع بالزر ليعمل كـ Push-to-Talk (زي واتساب)
-        const handleStart = (e) => {{ e.preventDefault(); useNativeMic ? startNativeRecording() : startRecording(); }};
-        const handleStop = (e) => {{ e.preventDefault(); useNativeMic ? stopNativeRecording() : stopRecording(); }};
-
-        micBtn.addEventListener('mousedown', handleStart);
-        micBtn.addEventListener('mouseup', handleStop);
-        micBtn.addEventListener('mouseleave', handleStop); // للإلغاء لو الماوس خرج عن الزر
-        
-        micBtn.addEventListener('touchstart', handleStart, {{passive: false}});
-        micBtn.addEventListener('touchend', handleStop, {{passive: false}});
-        micBtn.addEventListener('touchcancel', handleStop, {{passive: false}});
-
-
-        function handleImageSelect(e) {{
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(event) {{
-                currentBase64Image = event.target.result;
-                imagePreview.src = currentBase64Image;
-                imagePreviewContainer.style.display = 'block';
-                if(chatInput.style.display === 'block') chatInput.focus();
-            }};
-            reader.readAsDataURL(file);
-        }}
-        function cancelImage() {{ currentBase64Image = null; imagePreview.src = ""; imagePreviewContainer.style.display = 'none'; document.getElementById('hidden-camera-input').value = ""; }}
-        function toggleKeyboard() {{
-            if (chatInput.style.display === 'none' || chatInput.style.display === '') {{
-                chatInput.style.display = 'block'; micBtn.style.display = 'none'; sendTextBtn.style.display = 'flex'; chatInput.focus();
-            }} else {{
-                chatInput.style.display = 'none'; micBtn.style.display = 'flex'; sendTextBtn.style.display = 'none';
-            }}
-        }}
-
-        async function sendMessage(textOverride = null, audioData = null) {{
-            const text = textOverride !== null ? textOverride : chatInput.value.trim();
-            if (!text && !currentBase64Image && !audioData) return; 
-            
-            let userHtml = '';
-            if (audioData) {{
-                userHtml = `<div style="display: flex; flex-direction: column; gap: 8px;">
-                    <span style="font-size: 1rem; font-weight: bold;"><i class="bi bi-mic-fill text-danger me-2"></i> رسالة صوتية مسجلة</span>
-                    <audio controls src="${{audioData}}" style="height: 40px; max-width: 250px; outline: none; border-radius: 10px;"></audio>
-                </div>`;
-            }} else {{
-                userHtml = text;
-            }}
-            if (currentBase64Image) userHtml += (userHtml ? '<br>' : '') + `<img src="${{currentBase64Image}}">`;
-            
-            const uDiv = document.createElement('div'); uDiv.className = 'bubble user'; uDiv.innerHTML = userHtml; chatBox.appendChild(uDiv);
-            
-            // إضافة معرّف الجلسة هنا للـ Payload
-            const payload = {{ message: text || "", image_data: currentBase64Image, audio_data: audioData, session_id: currentSessionUuid }};
-            
-            chatInput.value = ''; cancelImage();
-            setTimeout(() => chatBox.scrollTop = chatBox.scrollHeight, 50);
-            
-            const aiDiv = document.createElement('div'); aiDiv.className = 'bubble ai text-warning'; aiDiv.innerHTML = 'الأسطى بيسمع ويفكر...'; chatBox.appendChild(aiDiv);
-
-            let fullResponseText = "";
-
-            try {{
-                const response = await fetch('/api/kiosk_chat', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(payload) }});
-                if(response.status === 429) {{ aiDiv.innerHTML = "<span class='text-danger'>راقب سرعتك يا هندسة! استنى شوية وحاول تاني.</span>"; return; }}
-                const reader = response.body.getReader(); const decoder = new TextDecoder("utf-8"); aiDiv.innerHTML = ""; aiDiv.classList.remove('text-warning');
-
-                while (true) {{
-                    const {{ done, value }} = await reader.read(); if (done) break;
-                    const lines = decoder.decode(value, {{ stream: true }}).split('\\n');
-                    for (const line of lines) {{
-                        if (line.startsWith('data: ')) {{
-                            try {{
-                                const data = JSON.parse(line.replace('data: ', '').trim());
-                                
-                                if (data.error === "NO_OPENAI_KEY_AUDIO") {{
-                                    useNativeMic = true;
-                                    aiDiv.innerHTML = `<span class="text-info fw-bold">⚠️ تم تبديل المايك للنظام الداخلي المجاني لعدم وجود مفتاح OpenAI. اضغط على المايك مرة تانية واتكلم براحتك!</span>`;
-                                    return;
-                                }}
-                                
-                                if (data.chunk) {{ 
-                                    fullResponseText += data.chunk; 
-                                    aiDiv.innerHTML = fullResponseText.replace(/\\n/g, '<br>'); 
-                                    chatBox.scrollTop = chatBox.scrollHeight; 
-                                }}
-                                else if (data.done) {{
-                                    if (!fullResponseText.trim()) {{
-                                        aiDiv.innerHTML = "<span class='text-muted'>مفيش رد وصل، السيرفر فصل، حاول تاني يا هندسة.</span>";
-                                        return;
-                                    }}
-                                    const safeText = data.full.replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/\\n/g, ' ');
-                                    aiDiv.innerHTML = data.full.replace(/\\n/g, '<br>') + `<button class="speak-btn" onclick="speakText(this, '${{safeText}}')"><i class="bi bi-volume-up-fill"></i></button>`;
-                                    speakText(aiDiv.querySelector('.speak-btn'), data.full);
-                                    
-                                    // إعادة تحميل الصفحة إن كانت هذه أول رسالة لكي يظهر اسم المحادثة الجديد
-                                    if(document.querySelectorAll('.bubble').length <= 3) {{
-                                        setTimeout(() => window.location.reload(), 2000);
-                                    }}
-                                }}
-                                else if (data.error) {{ aiDiv.innerHTML = `<span class="text-danger fw-bold">${{data.error}}</span>`; }}
-                            }} catch (e) {{}}
-                        }}
-                    }}
-                }}
-            }} catch (err) {{ aiDiv.innerHTML = "<span class='text-danger'>عطل في الشبكة. جرب تاني يا ريس.</span>"; }}
-        }}
-    </script>
-    """
-    return render_html_layout(content_html + content_js, "الأسطى", user)
-
-class ChatRequest(BaseModel):
-    message: str = Field("", max_length=2000)
-    image_data: Optional[str] = Field(None, max_length=5_000_000)
-    audio_data: Optional[str] = Field(None, max_length=10_000_000)
-    session_id: str = Field(...)
-
-class TTSRequest(BaseModel):
-    text: str
-
-@app.post("/api/tts")
-@limiter.limit("5/minute")
-async def generate_tts(request: Request, tts_req: TTSRequest, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user: raise HTTPException(status_code=401, detail="Unauthorized")
-    openai_key = decrypt_val(user.tenant.openai_api_key)
-    if not openai_key: raise HTTPException(status_code=400, detail="OpenAI Key Required.")
+# ==========================================
+# 2. التهيئة وقواعد البيانات (Firebase)
+# ==========================================
+@st.cache_resource
+def init_firebase():
     try:
-        response = openai.OpenAI(api_key=openai_key).audio.speech.create(model="tts-1", voice="onyx", input=tts_req.text)
-        return Response(content=response.read(), media_type="audio/mpeg")
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+        if not firebase_admin._apps:
+            cred = credentials.Certificate('firebase_config.json')
+            firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        st.error("خطأ في الاتصال بقاعدة بيانات Firebase. تأكد من ملف firebase_config.json")
+        return None
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def get_llm_response_stream(llm, messages): return llm.astream(messages)
+db = init_firebase()
 
-TECHNICAL_KEYWORDS = ["ضاغط", "مجفف", "فلتر", "أويل", "بيلت", "عطل", "ضغط", "بارد", "حرارة", "زيت", "صيانة", "ماكينة", "موتور", "صوت", "مشكلة", "صورة", "الحل", "خربان", "بايظ", "مكسور"]
-def is_technical_query(message: str) -> bool:
-    if not message: return True
-    return any(kw in message for kw in TECHNICAL_KEYWORDS)
+# ==========================================
+# 3. الدوال المساعدة (الصوت، معالجة النصوص، Pinecone)
+# ==========================================
 
-# =====================================================================
-# دالة المحادثة الاحترافية بعد دمج فلاتر الأخطاء المرنة والذكية 100%
-# =====================================================================
-@app.post("/api/kiosk_chat")
-@limiter.limit("10/minute")
-async def kiosk_chat_api(request: Request, chat_req: ChatRequest, db: AsyncSession = Depends(get_db)):
-    user = await get_current_user_from_cookie(request, db)
-    if not user: 
-        return StreamingResponse((f"data: {json.dumps({'error': 'يا هندسة، جلسة الدخول انتهت، يرجى إعادة تسجيل الدخول أولاً.'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-    
-    tenant = user.tenant
-    openai_key = decrypt_val(tenant.openai_api_key)
-    google_key = decrypt_val(tenant.google_api_key)
-    model_name = tenant.llm_model
-    provider = tenant.llm_provider
-    base_url = getattr(tenant, 'api_base_url', '')
+# دالة لتنظيف النص من الأرقام والرموز قبل القراءة
+def clean_text_for_speech(text):
+    # إزالة الأرقام والرموز (ترك الحروف العربية والإنجليزية والمسافات والنقاط)
+    cleaned = re.sub(r'[0-9!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]+', ' ', text)
+    return cleaned
 
-    transcribed_message = chat_req.message
+# دالة تحويل النص إلى صوت (لهجة مصرية)
+async def generate_audio(text, output_file="response.mp3"):
+    cleaned_text = clean_text_for_speech(text)
+    if not cleaned_text.strip():
+        cleaned_text = "لا يوجد نص مقروء"
+    # ar-EG-SalmaNeural (صوت أنثوي مصري) أو ar-EG-ShakirNeural (صوت ذكوري)
+    communicate = edge_tts.Communicate(cleaned_text, "ar-EG-SalmaNeural")
+    await communicate.save(output_file)
 
-    if chat_req.audio_data:
-        if not openai_key:
-            return StreamingResponse((f"data: {json.dumps({'error': 'NO_OPENAI_KEY_AUDIO'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-        try:
-            header, encoded = chat_req.audio_data.split(",", 1)
-            audio_bytes = base64.b64decode(encoded)
-            client = openai.OpenAI(api_key=openai_key)
-            ext = ".webm"
-            if "mp4" in header: ext = ".mp4"
-            elif "mpeg" in header or "mp3" in header: ext = ".mp3"
-            
-            temp_audio_path = ""
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_audio:
-                    temp_audio.write(audio_bytes)
-                    temp_audio_path = temp_audio.name
-                
-                with open(temp_audio_path, "rb") as audio_file:
-                    transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file, language="ar")
-                    transcribed_message = transcript.text
-            finally:
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.unlink(temp_audio_path)
+# دالة التشغيل التلقائي للصوت
+def autoplay_audio(file_path: str):
+    with open(file_path, "rb") as f:
+        data = f.read()
+        b64 = base64.b64encode(data).decode()
+        md = f"""
+            <audio controls autoplay="true" style="width: 100%; border-radius: 10px; border: 1px solid #00f3ff;">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+            """
+        st.markdown(md, unsafe_allow_html=True)
 
-        except openai.RateLimitError:
-            return StreamingResponse((f"data: {json.dumps({'error': '⏳ الخادم مشغول جداً حالياً، اهدى شوية يا هندسة وجرب تسجل تاني.'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-        except openai.APIConnectionError:
-            return StreamingResponse((f"data: {json.dumps({'error': '🌐 مشكلة في الاتصال بالإنترنت، تأكد من الشبكة وجرب تاني.'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-        except openai.AuthenticationError:
-            return StreamingResponse((f"data: {json.dumps({'error': '❌ مفتاح OpenAI المستخدَم للصوت غير صحيح أو منتهي الصلاحية. راجع المفتاح في الإعدادات.'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-        except Exception:
-            if not transcribed_message:
-                return StreamingResponse((f"data: {json.dumps({'error': '🎙️ الصوت مكانش واضح بسبب ضوضاء الورشة، جرب تسجل تاني أو اكتب المشكلة الكيبورد.'})}\n\n" for _ in range(1)), media_type="text/event-stream")
-
-    if not transcribed_message and not chat_req.image_data: transcribed_message = "بص على الصورة دي وقولي الحل إيه؟"
-
-    # تحديث اسم المحادثة تلقائياً لو كانت جديدة
-    current_session = (await db.execute(select(ChatSession).where(ChatSession.session_uuid == chat_req.session_id))).scalars().first()
-    if current_session:
-        if current_session.title == "محادثة جديدة":
-            new_title = " ".join(transcribed_message.split()[:4])
-            if not new_title: new_title = "محادثة صوتية"
-            current_session.title = new_title
-        current_session.updated_at = datetime.utcnow()
-        await db.commit()
-
-    rag_context = ""
-    if is_technical_query(transcribed_message) and pc_client_instance and tenant.pinecone_index:
-        try:
-            embeddings = OpenAIEmbeddings(openai_api_key=openai_key) if openai_key else GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_key) if google_key else None
-            if embeddings:
-                rag_context = "\n".join([d.page_content for d in PineconeVectorStore(index=pc_client_instance.Index(tenant.pinecone_index), embedding=embeddings, namespace=f"tenant_{tenant.id}").similarity_search(transcribed_message, k=2)])
-        except Exception: rag_context = ""
-
+# دالة تحويل الصوت إلى نص (باستخدام OpenAI Whisper)
+def transcribe_audio(audio_file, api_key):
     try:
-        if provider == "openai":
-            if not openai_key: raise ValueError("⚠️ مفتاح OpenAI مفقود! يرجى إدخاله في الإعدادات لتشغيل موديلات ChatGPT.")
-            kwargs = {"model_name": model_name, "openai_api_key": openai_key, "temperature": 0.3}
-            if base_url: kwargs["base_url"] = base_url
-            llm = ChatOpenAI(**kwargs)
-            
-        elif provider == "anthropic":
-            anthropic_key = decrypt_val(tenant.anthropic_api_key)
-            if not anthropic_key: raise ValueError("⚠️ مفتاح Anthropic مفقود! يرجى إدخاله في الإعدادات لتشغيل موديلات Claude.")
-            kwargs = {"model_name": model_name, "api_key": anthropic_key, "temperature": 0.3}
-            if base_url: kwargs["base_url"] = base_url
-            llm = ChatAnthropic(**kwargs)
-            
-        elif provider == "google":
-            if not google_key: raise ValueError("⚠️ مفتاح Google Gemini مفقود! يرجى إدخاله في الإعدادات لتشغيل المساعد عبر جيميناي.")
-            llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=google_key, temperature=0.3)
-            
-        elif provider == "custom":
-            if not base_url: raise ValueError("⚠️ يجب إدخال الرابط المخصص (Base URL) للمزود الخارجي في الإعدادات.")
-            kwargs = {"model_name": model_name, "openai_api_key": openai_key or "sk-custom", "temperature": 0.3, "base_url": base_url}
-            llm = ChatOpenAI(**kwargs)
-            
+        client = OpenAI(api_key=api_key)
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+        return transcript.text
+    except Exception as e:
+        st.error(f"خطأ في التعرف على الصوت: {e}")
+        return None
+
+# ==========================================
+# 4. إدارة الجلسات وتسجيل الدخول
+# ==========================================
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'role' not in st.session_state:
+    st.session_state.role = None
+if 'username' not in st.session_state:
+    st.session_state.username = None
+
+def login_screen():
+    st.markdown("<h1 style='text-align: center; color: #00f3ff; text-shadow: 0 0 20px #00f3ff;'>تسجيل الدخول</h1>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        username = st.text_input("👤 اسم المستخدم", placeholder="أدخل اسم المستخدم")
+        # ستريملت يدعم type="password" لإظهار النقاط وتوفير علامة العين في بعض المتصفحات
+        password = st.text_input("🔑 كلمة المرور", type="password", placeholder="أدخل الرقم السري")
+        
+        if st.button("دخول 🚀"):
+            if db:
+                users_ref = db.collection('users').where('username', '==', username).where('password', '==', password).stream()
+                user = list(users_ref)
+                if user:
+                    user_data = user[0].to_dict()
+                    st.session_state.logged_in = True
+                    st.session_state.role = user_data.get('role', 'worker')
+                    st.session_state.username = username
+                    st.rerun()
+                else:
+                    # حساب افتراضي للمدير في حالة عدم وجود بيانات (لأول مرة)
+                    if username == "admin" and password == "admin123":
+                        st.session_state.logged_in = True
+                        st.session_state.role = 'manager'
+                        st.session_state.username = "Admin"
+                        st.rerun()
+                    else:
+                        st.error("❌ بيانات الدخول غير صحيحة!")
+
+# ==========================================
+# 5. واجهة التطبيق الرئيسية (شاشات المدير والعامل)
+# ==========================================
+def main_app():
+    # جلب الإعدادات من Firebase
+    settings = db.collection('settings').document('config').get().to_dict() or {}
+    
+    openai_api_key = settings.get('openai_api_key', '')
+    pinecone_api_key = settings.get('pinecone_api_key', '')
+    pinecone_env = settings.get('pinecone_env', '')
+    pinecone_index = settings.get('pinecone_index', '')
+    llm_model = settings.get('llm_model', 'gpt-4o-mini')
+    system_prompt = settings.get('system_prompt', 'أنت مساعد ذكي ومفيد. أجب باللغة العربية.')
+    agent_name = settings.get('agent_name', 'المساعد الذكي')
+
+    # القائمة الجانبية (للمدير فقط أو زر تسجيل الخروج للعامل)
+    with st.sidebar:
+        st.markdown(f"### أهلاً، {st.session_state.username} 👋")
+        if st.session_state.role == 'manager':
+            page = st.radio("القائمة", ["💬 الشات", "⚙️ الإعدادات العامة", "🗂️ إدارة قاعدة المعرفة (Pinecone)", "👥 إدارة الحسابات"])
         else:
-            raise ValueError("⚙️ مزود الخدمة المختار غير مدعوم في النظام حالياً.")
+            page = "💬 الشات"
+            st.info("صلاحيات عامل: واجهة المحادثة فقط.")
+        
+        if st.button("تسجيل الخروج 🚪"):
+            st.session_state.logged_in = False
+            st.rerun()
+
+    # -----------------------------------------
+    # صفحة الشات (متاحة للجميع)
+    # -----------------------------------------
+    if page == "💬 الشات":
+        st.markdown(f"<h2 style='text-align: center; color: #bc13fe;'>🤖 {agent_name}</h2>", unsafe_allow_html=True)
+        
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
+
+        # عرض الرسائل السابقة
+        for msg in st.session_state.messages:
+            if msg["role"] == "user":
+                st.markdown(f"<div class='user-msg'>{msg['content']}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='bot-msg'>{msg['content']}</div>", unsafe_allow_html=True)
+
+        # قسم الإدخال (صوت + صورة + نص) بطريقة تشبه واتساب
+        st.markdown("---")
+        
+        # التقاط الصوت مباشرة من المتصفح (ميزة جديدة في ستريملت)
+        audio_value = st.audio_input("🎤 اضغط للتحدث (رسالة صوتية)")
+        uploaded_image = st.file_uploader("📷 إرفاق صورة (اختياري)", type=['png', 'jpg', 'jpeg'])
+        prompt = st.chat_input("✍️ أو اكتب رسالتك هنا...")
+
+        user_input = None
+
+        if audio_value:
+            with st.spinner("جاري الاستماع وتحويل الصوت..."):
+                user_input = transcribe_audio(audio_value, openai_api_key)
+                if user_input:
+                     st.success(f"تم سماع: {user_input}")
+
+        if prompt:
+            user_input = prompt
+
+        if user_input:
+            if not openai_api_key:
+                st.error("⚠️ يرجى من المدير إدخال مفتاح OpenAI في الإعدادات.")
+                return
+
+            # إضافة رسالة المستخدم للشاشة
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            st.markdown(f"<div class='user-msg'>{user_input}</div>", unsafe_allow_html=True)
+
+            with st.spinner("جاري التفكير... 🤔"):
+                try:
+                    # تجهيز Langchain & Pinecone
+                    os.environ['OPENAI_API_KEY'] = openai_api_key
+                    os.environ['PINECONE_API_KEY'] = pinecone_api_key
+                    
+                    llm = ChatOpenAI(model_name=llm_model, temperature=0.3)
+                    
+                    # محاولة الاتصال بـ Pinecone للحصول على السياق
+                    context = ""
+                    if pinecone_api_key and pinecone_index:
+                        try:
+                            pc = Pinecone(api_key=pinecone_api_key)
+                            embeddings = OpenAIEmbeddings()
+                            vectorstore = PineconeVectorStore(index_name=pinecone_index, embedding=embeddings)
+                            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+                            docs = retriever.invoke(user_input)
+                            context = "\n".join([doc.page_content for doc in docs])
+                        except Exception as e:
+                            st.warning("تعذر جلب البيانات من Pinecone. سيتم الرد من معلومات الموديل العامة.")
+                    
+                    # دمج البرومبت مع السياق
+                    final_prompt = f"{system_prompt}\n\nمعلومات إضافية للمساعدة:\n{context}\n\nسؤال المستخدم: {user_input}"
+                    
+                    response = llm.invoke(final_prompt)
+                    bot_reply = response.content
+
+                    # حفظ وعرض رسالة البوت
+                    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
+                    st.markdown(f"<div class='bot-msg'>{bot_reply}</div>", unsafe_allow_html=True)
+
+                    # تحويل الرد إلى صوت وتشغيله تلقائياً
+                    asyncio.run(generate_audio(bot_reply, "temp_reply.mp3"))
+                    autoplay_audio("temp_reply.mp3")
+
+                except Exception as e:
+                    st.error(f"حدث خطأ أثناء معالجة الطلب: {str(e)}")
+
+    # -----------------------------------------
+    # صفحة الإعدادات (للمدير فقط)
+    # -----------------------------------------
+    elif page == "⚙️ الإعدادات العامة":
+        st.header("⚙️ إعدادات النظام و APIs")
+        with st.form("settings_form"):
+            new_name = st.text_input("🤖 اسم المساعد (يظهر في الشات)", value=agent_name)
+            new_prompt = st.text_area("🧠 شخصية المساعد (System Prompt)", value=system_prompt)
+            new_model = st.selectbox("⚙️ نموذج LLM", ["gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"], index=["gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"].index(llm_model) if llm_model in ["gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini"] else 2)
             
-    except ValueError as ve: 
-        return StreamingResponse((f"data: {json.dumps({'error': str(ve)})}\n\n" for _ in range(1)), media_type="text/event-stream")
-    except Exception as e: 
-        return StreamingResponse((f"data: {json.dumps({'error': f'حدث خطأ أثناء تهيئة الموديل: {str(e)}'})}\n\n" for _ in range(1)), media_type="text/event-stream")
+            # حقول سرية (نوع password لرؤية النجوم، ومعظم المتصفحات تظهر عين للكشف)
+            new_openai = st.text_input("🔑 مفتاح OpenAI API", value=openai_api_key, type="password")
+            new_pinecone = st.text_input("🔑 مفتاح Pinecone API", value=pinecone_api_key, type="password")
+            new_pinecone_idx = st.text_input("🗂️ اسم فهرس Pinecone (Index Name)", value=pinecone_index)
 
-    history = await get_chat_history(chat_req.session_id, db, limit=3)
-    system_instruction = f"{tenant.workshop_prompt}\n\nتاريخ المحادثة السابقة:\n{history}\n\nمعلومات فنية من الكتالوجات:\n{rag_context}"
-    messages = [SystemMessage(content=system_instruction), HumanMessage(content=[{"type": "text", "text": transcribed_message}] + ([{"type": "image_url", "image_url": {"url": chat_req.image_data}}] if chat_req.image_data else []))]
-    await save_chat_history(chat_req.session_id, "Worker", f"🎙️ {transcribed_message}" if chat_req.audio_data else (transcribed_message or "[صورة]"), db, tenant.id)
-    
-    logger.info(f"USER_ACTION | user={user.username} | tenant={user.tenant_id} | action=chat | provider={provider} | model={model_name}")
+            submit = st.form_submit_button("حفظ الإعدادات 💾")
+            if submit:
+                db.collection('settings').document('config').set({
+                    'agent_name': new_name,
+                    'system_prompt': new_prompt,
+                    'llm_model': new_model,
+                    'openai_api_key': new_openai,
+                    'pinecone_api_key': new_pinecone,
+                    'pinecone_index': new_pinecone_idx
+                })
+                st.success("✅ تم حفظ الإعدادات بنجاح!")
+                st.rerun()
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        full_response = ""
-        try:
-            async for chunk in (await get_llm_response_stream(llm, messages)):
-                if chunk.content:
-                    full_response += chunk.content
-                    yield f"data: {json.dumps({'chunk': chunk.content})}\n\n"
-            await save_chat_history(chat_req.session_id, "AI", full_response, db, tenant.id)
-            yield f"data: {json.dumps({'done': True, 'full': full_response})}\n\n"
+    # -----------------------------------------
+    # صفحة إدارة Pinecone (للمدير فقط)
+    # -----------------------------------------
+    elif page == "🗂️ إدارة قاعدة المعرفة (Pinecone)":
+        st.header("🗂️ رفع الملفات لتدريب المساعد")
+        if not pinecone_api_key or not pinecone_index or not openai_api_key:
+            st.warning("⚠️ يرجى ضبط مفاتيح Pinecone و OpenAI من الإعدادات أولاً.")
+        else:
+            uploaded_file = st.file_uploader("رفع ملف PDF", type="pdf")
+            if uploaded_file is not None:
+                if st.button("بدء الرفع والتحليل 🚀"):
+                    with st.spinner("جاري استخراج النص وتشفيره ورفعه لـ Pinecone..."):
+                        try:
+                            # قراءة PDF
+                            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                            text = ""
+                            for page_num in range(len(doc)):
+                                text += doc.page_content
+                            
+                            # تقسيم النص
+                            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                            chunks = text_splitter.split_text(text)
+                            
+                            # الرفع
+                            os.environ['OPENAI_API_KEY'] = openai_api_key
+                            pc = Pinecone(api_key=pinecone_api_key)
+                            embeddings = OpenAIEmbeddings()
+                            PineconeVectorStore.from_texts(chunks, embeddings, index_name=pinecone_index)
+                            
+                            st.success("✅ تم التدريب على الملف بنجاح! يمكن للمساعد الآن الإجابة منه.")
+                        except Exception as e:
+                            st.error(f"❌ حدث خطأ: {e}")
             
-        except Exception as e:
-            err_str = str(e)
-            yield f"data: {json.dumps({'error': f'❌ خطأ من الخادم ({model_name}): {err_str}'})}\n\n"
+            st.markdown("---")
+            st.subheader("🗑️ مسح جميع البيانات من Pinecone")
+            if st.button("حذف الكُل ⚠️"):
+                try:
+                    pc = Pinecone(api_key=pinecone_api_key)
+                    index = pc.Index(pinecone_index)
+                    index.delete(delete_all=True)
+                    st.success("✅ تم تفريغ قاعدة البيانات بنجاح.")
+                except Exception as e:
+                    st.error(f"❌ خطأ أثناء الحذف: {e}")
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    # -----------------------------------------
+    # صفحة إدارة الحسابات (للمدير فقط)
+    # -----------------------------------------
+    elif page == "👥 إدارة الحسابات":
+        st.header("👥 إنشاء وإدارة حسابات العمال")
+        
+        with st.form("new_user"):
+            new_u = st.text_input("اسم المستخدم")
+            new_p = st.text_input("كلمة المرور", type="password")
+            new_r = st.selectbox("الصلاحية", ["worker", "manager"], format_func=lambda x: "عامل (شات فقط)" if x == "worker" else "مدير (تحكم كامل)")
+            
+            if st.form_submit_button("إنشاء حساب ➕"):
+                db.collection('users').add({
+                    'username': new_u,
+                    'password': new_p,
+                    'role': new_r
+                })
+                st.success(f"✅ تم إنشاء حساب '{new_u}' بنجاح!")
+        
+        st.markdown("---")
+        st.subheader("الحسابات الحالية")
+        users = db.collection('users').stream()
+        for u in users:
+            udata = u.to_dict()
+            colA, colB, colC = st.columns([2,2,1])
+            colA.write(f"👤 {udata['username']}")
+            colB.write(f"🏷️ {'مدير' if udata['role'] == 'manager' else 'عامل'}")
+            if colC.button("حذف 🗑️", key=u.id):
+                db.collection('users').document(u.id).delete()
+                st.rerun()
 
+# ==========================================
+# 6. نقطة الإطلاق التشغيلية
+# ==========================================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    if not st.session_state.logged_in:
+        login_screen()
+    else:
+        main_app()
